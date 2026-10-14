@@ -12,7 +12,7 @@ from PIL import Image
 from pydantic import BaseModel, ValidationError
 
 from marker.schema.blocks import Block
-from marker.services import BaseService, InvalidLLMResponse
+from marker.services import BaseService
 
 logger = get_logger()
 
@@ -124,12 +124,8 @@ class OpenAIService(BaseService):
                     return response_schema.model_validate_json(response_text).model_dump()
                 except ValidationError as error:
                     errors = [f'{e["loc"]}: {e["msg"]}' for e in error.errors(include_input=False)]
-                    try:
-                        candidate = json.loads(response_text)
-                    except json.JSONDecodeError:
-                        candidate = response_text
                     logger.warning("LLM response failed schema validation (%d errors)", len(errors))
-                    return InvalidLLMResponse(candidate, errors)
+                    return {}
             except (APITimeoutError, RateLimitError) as e:
                 # Rate limit exceeded
                 if tries == total_tries:

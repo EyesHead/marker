@@ -35,7 +35,6 @@ from marker.processors.llm.llm_complex import LLMComplexRegionProcessor
 from marker.processors.llm.llm_form import LLMFormProcessor
 from marker.processors.llm.llm_image_description import LLMImageDescriptionProcessor
 from marker.processors.llm.llm_table import LLMTableProcessor
-from marker.processors.llm.llm_table_json import LLMTableJSONProcessor
 from marker.processors.page_header import PageHeaderProcessor
 from marker.processors.reference import ReferenceProcessor
 from marker.processors.sectionheader import SectionHeaderProcessor
@@ -101,7 +100,6 @@ class PdfConverter(BaseConverter):
         SectionHeaderProcessor,
         TableProcessor,
         LLMTableProcessor,
-        LLMTableJSONProcessor,
         LLMTableMergeProcessor,
         LLMFormProcessor,
         TextProcessor,
@@ -224,7 +222,7 @@ class PdfConverter(BaseConverter):
             if (
                 isinstance(processor, (BaseLLMProcessor, TableProcessor))
                 and not isinstance(
-                    processor, (LLMTableMergeProcessor, LLMSectionHeaderProcessor, LLMTableJSONProcessor)
+                    processor, (LLMTableMergeProcessor, LLMSectionHeaderProcessor)
                 )
             ):
                 for start in range(0, len(document.pages), self.page_batch_size):

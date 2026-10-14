@@ -17,7 +17,6 @@ logger = get_logger()
 
 
 class LLMTableProcessor(BaseLLMComplexBlockProcessor):
-    table_json_reconstruction: Annotated[bool, "Use the JSON reconstruction processor for tables."] = False
     extract_images: Annotated[bool, "Save pictures found inside table cells."] = True
     block_types: Annotated[
         Tuple[BlockTypes],
@@ -120,8 +119,6 @@ score: 5
             return image.rotate(90, expand=True)
 
     def process_rewriting(self, document: Document, page: PageGroup, block: Table):
-        if self.table_json_reconstruction and block.block_type == BlockTypes.Table:
-            return
         children: List[TableCell] = block.contained_blocks(
             document, (BlockTypes.TableCell,)
         )

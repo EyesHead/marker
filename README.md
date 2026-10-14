@@ -1,20 +1,16 @@
-# Marker: PDF → Markdown и таблицы в JSON
+# Marker: PDF → Markdown с HTML-таблицами
 
-Форк [EyesHead/marker](https://github.com/EyesHead/marker) для конвертации русскоязычных PDF, включая СП и ГОСТ. Текст сохраняется в Markdown, таблицы — в HTML внутри Markdown и отдельном JSON с координатами, объединёнными ячейками, формулами и изображениями.
+Форк [EyesHead/marker](https://github.com/EyesHead/marker) для русскоязычных PDF, включая СП и ГОСТ. Текст и формулы сохраняются в Markdown, все таблицы — в HTML внутри Markdown. Объединённые ячейки используют `rowspan` и `colspan`, рисунки сохраняются отдельными файлами и вставляются через `<img>` в соответствующие ячейки. Продолжения таблиц между страницами объединяются после проверки LLM.
 
-Основной вариант — **Ollama Cloud + Gemma 4 31B**. Gemma работает в облаке; Marker и OCR работают на вашем компьютере. Установка локальной Gemma не требуется.
+Основной вариант — **Ollama Cloud + Gemma 4 31B**. Gemma работает в облаке; Marker и, при необходимости, OCR работают на вашем компьютере. Результат удобно проверять в режиме чтения Obsidian. Отдельная JSON-реконструкция таблиц удалена.
 
-## Что нужно
+Версия с восстановленными HTML-таблицами находится в ветке **`codex/my-change`**. Скрипт по умолчанию устанавливает эту ветку. После её слияния в `master` можно явно задать `MARKER_REF=master` при обновлении.
 
-- Python 3.10 или новее, Git и доступ к интернету.
-- Аккаунт Ollama и [API-ключ](https://ollama.com/settings/keys). Доступ к модели зависит от лимитов аккаунта.
-- PDF в папке `PDF` рядом со скриптом.
+## Запуск на macOS: все PDF из папки
 
-Стабильная ветка с этими доработками: `master`.
+Нужны Python 3.10 или новее, Git, интернет и [API-ключ Ollama](https://ollama.com/settings/keys).
 
-## 1. Основной запуск на macOS: все PDF из папки
-
-Расположение папок:
+Папки остаются прежними:
 
 ```text
 PolytechBrain/
@@ -22,130 +18,104 @@ PolytechBrain/
   PDF/
     document.pdf
   Output/
+    document/
+      document.md
+      ...изображения...
 ```
 
-Для первого получения скрипта:
+Получите обновлённый скрипт:
 
 ```bash
 cd "$HOME/BRAIN_University/PolytechBrain"
-curl -fL https://raw.githubusercontent.com/EyesHead/marker/refs/heads/master/ScriptMacOS-Ollama.sh -o ScriptMacOS-Ollama.sh
+curl -fL https://raw.githubusercontent.com/EyesHead/marker/refs/heads/codex/my-change/ScriptMacOS-Ollama.sh -o ScriptMacOS-Ollama.sh
 chmod +x ScriptMacOS-Ollama.sh
 ```
 
-Запуск из этой же папки:
+Для PDF с читаемым текстовым слоем, в том числе на Mac M1 с ограниченной памятью:
+
+```bash
+DISABLE_OCR=1 ./ScriptMacOS-Ollama.sh
+```
+
+В начале появится окно для ключа Ollama. Ключ используется только на время запуска и не сохраняется в файл. Если `OLLAMA_API_KEY` уже задан в окружении, окно пропускается.
+
+Скрипт один раз скачивает форк и устанавливает зависимости в `~/.cache/eyeshead-marker`. При обнаружении прежнего JSON-конвейера он однократно обновляет установленный код. Последующие запуски используют кэш; автоматического обновления при каждом запуске нет.
+
+Готовые Markdown пропускаются. Результаты прежнего JSON-конвейера, рядом с которыми есть `document_tables.json`, автоматически пересобираются в HTML. Старый отчёт удаляется после успешного сохранения нового Markdown.
+
+## Повторная конвертация и явное обновление
+
+Пересобрать все PDF, включая уже готовые:
+
+```bash
+FORCE=1 DISABLE_OCR=1 ./ScriptMacOS-Ollama.sh
+```
+
+Обновить установленный Marker из выбранной ветки и пересобрать PDF:
+
+```bash
+UPDATE_MARKER=1 FORCE=1 DISABLE_OCR=1 ./ScriptMacOS-Ollama.sh
+```
+
+После слияния HTML-версии в `master`:
+
+```bash
+MARKER_REF=master UPDATE_MARKER=1 FORCE=1 DISABLE_OCR=1 ./ScriptMacOS-Ollama.sh
+```
+
+## Сканы и повреждённый текстовый слой
+
+Для автоматического определения страниц, которым нужен OCR:
 
 ```bash
 ./ScriptMacOS-Ollama.sh
 ```
 
-В начале появится окно для API-ключа Ollama. Ключ не сохраняется в файл. Если в окружении уже задан `OLLAMA_API_KEY`, окно пропускается.
-
-Скрипт один раз скачивает форк и устанавливает зависимости в `~/.cache/eyeshead-marker`. При переходе с прежней версии выполняется однократное обновление. Обычные повторные запуски используют установленную копию и пропускают PDF, для которых уже есть Markdown.
-
-## 2. Повторная обработка готовых PDF
+Для принудительного OCR всех страниц:
 
 ```bash
-cd "$HOME/BRAIN_University/PolytechBrain"
-FORCE=1 ./ScriptMacOS-Ollama.sh
+FORCE=1 FORCE_OCR=1 ./ScriptMacOS-Ollama.sh
 ```
 
-Это нужно, например, чтобы получить JSON таблиц для PDF, сконвертированных старым скриптом.
+OCR использует локальные модели Marker и требует памяти. `DISABLE_OCR=1` подходит только для читаемого текстового слоя; его нельзя совмещать с `FORCE_OCR=1`.
 
-## 3. Один PDF через Marker CLI и Ollama Cloud
+## Один PDF через CLI и Ollama Cloud
 
-Один раз установите эту ветку в отдельное Python-окружение:
+Однократная установка:
 
 ```bash
-git clone --branch master https://github.com/EyesHead/marker.git
+git clone --branch codex/my-change https://github.com/EyesHead/marker.git
 cd marker
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --editable .
 ```
 
-Введите ключ скрыто; переменная `OPENAI_API_KEY` здесь содержит **ключ Ollama** для совместимого API:
+Введите ключ скрыто. `OPENAI_API_KEY` здесь содержит ключ **Ollama** для совместимого API:
 
 ```bash
 export OPENAI_API_KEY="$(python -c 'import getpass; print(getpass.getpass("Ollama API key: "))')"
 ```
 
-Замените `document.pdf` на имя вашего файла:
+Запуск для PDF с текстовым слоем:
 
 ```bash
-marker_single "$HOME/BRAIN_University/PolytechBrain/PDF/document.pdf" \
-  --output_dir "$HOME/BRAIN_University/PolytechBrain/Output" \
+marker_single document.pdf \
+  --output_dir Output \
   --output_format markdown \
   --use_llm \
   --llm_service marker.services.openai.OpenAIService \
   --openai_base_url https://ollama.com/v1 \
   --openai_model gemma4:31b \
   --openai_image_format png \
-  --table_json_reconstruction \
+  --disable_ocr \
   --redo_inline_math \
   --max_concurrency 1 \
   --max_output_tokens 32768 \
   --timeout 180
+unset OPENAI_API_KEY
 ```
 
-Для прямого облачного API используется имя `gemma4:31b`; суффикс `-cloud` не требуется. [Документация Ollama](https://docs.ollama.com/api/openai-compatibility).
+Для скана уберите `--disable_ocr`. В прямом облачном API используется имя `gemma4:31b`.
 
-### PDF с текстовым слоем на Mac с ограниченной памятью
-
-Чтобы читать существующий текстовый слой без локального Surya VLM:
-
-```bash
-DISABLE_OCR=1 ./ScriptMacOS-Ollama.sh
-```
-
-В CLI добавьте `--disable_ocr`. Таблицы и исправление формул через Gemma
-продолжают работать в облаке. Этот режим подходит только для PDF с читаемым
-текстовым слоем: сканированные страницы он не распознаёт. Не совмещайте его
-с `FORCE_OCR=1`.
-
-## 4. Сканы или PDF с повреждённым текстовым слоем
-
-Для независимого OCR с координатами таблиц установите Tesseract с русским и английским языками:
-
-```bash
-brew install tesseract tesseract-lang
-```
-
-Принудительно распознать PDF заново через скрипт:
-
-```bash
-cd "$HOME/BRAIN_University/PolytechBrain"
-FORCE_OCR=1 FORCE=1 ./ScriptMacOS-Ollama.sh
-```
-
-При запуске через CLI добавьте `--force_ocr` к команде из сценария 3. Для обычного PDF с корректным текстовым слоем этот флаг не нужен.
-
-## Результат
-
-Для `document.pdf` скрипт сохраняет:
-
-```text
-Output/document/
-  document.md
-  document_tables.json
-  изображения ячеек и рисунков
-```
-
-В `document_tables.json`:
-
-- `reconstruction.tables` — принятые таблицы: сетка, роли ячеек, spans, исходный текст, LaTeX, рисунки и привязка к блокам.
-- `sources` — координаты исходных фрагментов и необязательные линии PDF.
-- `validation` — отчёты со статусами `structurally_valid`, `needs_review` или `rejected`. При отклонении сохраняется доступный ответ/кандидат для разбора.
-
-## Как проверяются таблицы
-
-Marker сначала извлекает текст и геометрию из PDF или координатного OCR. Gemma получает изображения таблиц вместе с этими данными и возвращает JSON. Код проверяет схему, покрытие сетки, пересечения объединённых ячеек, ссылки на блоки, координаты строк и колонок, числовую запись и парность разделителей формул.
-
-Продолжения таблиц сверяются по общим исходным блокам. HTML и изображения ячеек создаются кодом после проверки. Если JSON отклонён или требует проверки, прежняя таблица в Markdown сохраняется вместе с исходным изображением, а результат попадает в отчёт. Скрипт сохраняет эти файлы и завершает работу с кодом `2`, чтобы такой результат не считался проверенным.
-
-`structurally_valid` означает успешную проверку структуры и привязок; он не гарантирует правильность каждого инженерного символа. Проверка через облачную Gemma на пяти страницах контрольного СП (таблицы 2 и 8) выявила ошибки соответствия строк и координат: обе таблицы отклонены. Полный прогон СП пока не подтверждён; текущую реконструкцию сложных таблиц следует считать экспериментальной.
-
-Ollama Cloud [сейчас не поддерживает принудительные structured outputs](https://docs.ollama.com/capabilities/structured-outputs). Поэтому схема передаётся в промпте, температура равна 0, а валидация выполняется локально с ограниченными повторными попытками.
-
-[Промпт](marker/tables/russian_normative.md) · [JSON Schema](marker/tables/schema.json) · [Модели данных](marker/tables/schema.py)
-
-Лицензия: [Apache 2.0](LICENSE).
+Результат: `Output/document/document.md` и изображения рядом. Проверьте сложные таблицы, формулы и склейку продолжений по исходному PDF: LLM может ошибаться даже при корректном HTML.

@@ -3,7 +3,7 @@
 # Положите скрипт рядом с прежним ScriptMacOS.sh в хранилище PolytechBrain.
 # Источник:  <папка скрипта>/PDF/*.pdf
 # Результат: <папка скрипта>/Output/<имя PDF>/<имя PDF>.md и изображения рядом.
-# Проверенные таблицы и отчёт: <имя PDF>_tables.json в той же папке.
+# Таблицы — HTML внутри Markdown; рисунки сохраняются в исходных ячейках.
 # Готовые результаты пропускаются; FORCE=1 ./ScriptMacOS-Ollama.sh пересобирает их.
 
 set -u
@@ -11,7 +11,7 @@ set -o pipefail
 
 # Настройки
 MARKER_REPO="https://github.com/EyesHead/marker.git"
-MARKER_REF="master"
+MARKER_REF="${MARKER_REF:-codex/my-change}"
 MARKER_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/eyeshead-marker"
 MARKER_ROOT="$MARKER_CACHE/source"
 MARKER_VENV="$MARKER_CACHE/venv"
@@ -53,8 +53,7 @@ for pdf in "${pdf_files[@]}"; do
     base="$(basename "$pdf")"
     name="${base%.*}"
     if [ -f "$OUTPUT_DIR/$name/$name.md" ] && [ "${FORCE:-0}" != "1" ] && \
-       ! grep -Eq '"status"[[:space:]]*:[[:space:]]*"(rejected|needs_review)"' \
-            "$OUTPUT_DIR/$name/${name}_tables.json" 2>/dev/null; then
+       [ ! -f "$OUTPUT_DIR/$name/${name}_tables.json" ]; then
         echo "Пропуск: $base уже сконвертирован (для пересборки: FORCE=1)."
     else
         pending+=("$pdf")
@@ -174,17 +173,25 @@ if [ "$repo_origin" != "$MARKER_REPO" ]; then
     echo "Ошибка: кэш $MARKER_ROOT принадлежит другому репозиторию: $repo_origin" >&2
     exit 1
 fi
-if [ ! -f "$MARKER_ROOT/marker/processors/llm/llm_table_json.py" ]; then
+# Старый JSON-конвейер заменяем один раз; обычные запуски не обращаются к GitHub.
+# UPDATE_MARKER=1 позволяет явно обновить установленную версию позднее.
+if [ -f "$MARKER_ROOT/marker/processors/llm/llm_table_json.py" ] || \
+   [ "${UPDATE_MARKER:-0}" = "1" ]; then
     if [ -n "$(git -C "$MARKER_ROOT" status --porcelain)" ]; then
         echo "Ошибка: в кэше Marker есть изменения; обновите его вручную: $MARKER_ROOT" >&2
         exit 1
     fi
-    echo "Однократно обновляю Marker для реконструкции таблиц в JSON..."
+    echo "Обновляю Marker для HTML-таблиц с изображениями..."
     if ! git -C "$MARKER_ROOT" fetch --depth 1 origin "$MARKER_REF" || \
        ! git -C "$MARKER_ROOT" checkout --detach FETCH_HEAD; then
         echo "Ошибка: не удалось обновить кэш Marker." >&2
         exit 1
     fi
+fi
+if [ -f "$MARKER_ROOT/marker/processors/llm/llm_table_json.py" ]; then
+    echo "Ошибка: ветка $MARKER_REF ещё содержит JSON-конвейер таблиц." >&2
+    echo "Используйте ветку codex/my-change с восстановленными HTML-таблицами." >&2
+    exit 1
 fi
 if ! grep -q 'page_batch_size' "$MARKER_ROOT/marker/converters/pdf.py" || \
    ! grep -q 'data-bbox' "$MARKER_ROOT/marker/processors/llm/llm_table.py"; then
@@ -224,7 +231,6 @@ echo "LLM: облачный Ollama API, модель $OLLAMA_MODEL."
 echo "Пакет страниц: $PAGE_BATCH_SIZE; на каждый PDF один запуск Marker."
 
 failed=0
-quality_issues=0
 for pdf in "${pending[@]}"; do
     base="$(basename "$pdf")"
     name="${base%.*}"
@@ -244,7 +250,6 @@ for pdf in "${pending[@]}"; do
         --page_batch_size "$PAGE_BATCH_SIZE"
         --max_concurrency 1
         --timeout 180
-        --table_json_reconstruction
         --max_output_tokens 32768
     )
     if [ "$REDO_INLINE_MATH" = "1" ]; then args+=(--redo_inline_math); fi
@@ -268,34 +273,6 @@ for pdf in "${pending[@]}"; do
         continue
     fi
 
-    # A successful Marker exit alone does not mean table reconstruction passed.
-    table_status=0
-    "$MARKER_VENV/bin/python" - "$generated_dir/${name}_tables.json" <<'TABLECHECK' || table_status=$?
-import json
-import sys
-from collections import Counter
-
-try:
-    with open(sys.argv[1], encoding="utf-8") as source:
-        archive = json.load(source)
-    reports = archive["validation"]
-    counts = Counter(report["status"] for report in reports)
-    accepted = len(archive["reconstruction"]["tables"])
-except (OSError, ValueError, KeyError, TypeError) as error:
-    print(f"Ошибка: отчёт таблиц недоступен ({type(error).__name__}).", file=sys.stderr)
-    sys.exit(1)
-print(f"Таблицы: принято {accepted}; проверка: {dict(counts)}.")
-if any(status != "structurally_valid" for status in counts):
-    print("Таблицы требуют проверки. Результат и исходные изображения будут сохранены.", file=sys.stderr)
-    sys.exit(2)
-TABLECHECK
-    if [ "$table_status" = "1" ]; then
-        failed=$((failed + 1))
-        continue
-    elif [ "$table_status" != "0" ]; then
-        quality_issues=$((quality_issues + 1))
-    fi
-
     # Публикуем результат только после успешной конвертации всего PDF.
     # Старые файлы при FORCE сохраняются, пока новый Markdown не готов.
     if ! mkdir -p "$note_dir"; then
@@ -307,7 +284,7 @@ TABLECHECK
     for asset in "$generated_dir"/*; do
         [ -f "$asset" ] || continue
         case "$asset" in
-            *.md|*_meta.json) ;;
+            *.md|*.json) ;;
             *)
                 if ! mv -f "$asset" "$note_dir/"; then
                     assets_ok=0
@@ -321,20 +298,14 @@ TABLECHECK
         failed=$((failed + 1))
         continue
     fi
-    if [ "$table_status" = "0" ]; then
-        echo "Готово: $note_dir/$name.md"
-    else
-        echo "Сохранено для проверки: $note_dir/$name.md"
-    fi
+    # Удаляем отчёт прежнего JSON-конвейера после сохранения нового Markdown.
+    rm -f "$note_dir/${name}_tables.json"
+    echo "Готово: $note_dir/$name.md"
 done
 
 echo "--------------------------------------------------"
 if [ "$failed" -gt 0 ]; then
     echo "Завершено с ошибками: $failed PDF. Успешные результаты сохранены." >&2
     exit 1
-fi
-if [ "$quality_issues" -gt 0 ]; then
-    echo "Результаты сохранены, но таблицы требуют проверки в $quality_issues PDF." >&2
-    exit 2
 fi
 echo "Все PDF обработаны."

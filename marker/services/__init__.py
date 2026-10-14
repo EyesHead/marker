@@ -9,19 +9,6 @@ from marker.util import assign_config, verify_config_keys
 import base64
 
 
-class InvalidLLMResponse(dict):
-    """An empty/falsey result with diagnostics for processors that can repair it.
-
-    Legacy processors still see a failed response. The table JSON processor can
-    retain the candidate and give the actual schema violations back to the LLM.
-    """
-
-    def __init__(self, response, errors: list[str]):
-        super().__init__()
-        self.response = response
-        self.errors = errors
-
-
 class BaseService:
     timeout: Annotated[int, "The timeout to use for the service."] = 30
     max_retries: Annotated[
