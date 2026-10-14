@@ -65,6 +65,17 @@ def _native_transpose(matrix):
     return False, None
 
 
+def _native_extraction_orientation(obj):
+    """PDFium renders the child matrix; ancestors need a lossless transpose.
+
+    Individually tilted components can cancel into an axis-aligned total,
+    but rendering the child first would already resample/rotate its pixels.
+    """
+    child_supported, _ = _native_transpose(obj.get_matrix())
+    ancestor_supported, orientation = _native_transpose(_ancestor_matrix(obj))
+    return child_supported and ancestor_supported, orientation
+
+
 @dataclass(frozen=True)
 class NativeImage:
     """One displayed image instance; width/height describe its source pixels.
@@ -310,19 +321,22 @@ class PdfSource:
     def extract_image(self, image: NativeImage) -> Image.Image:
         """Decode pixels/masks; apply lossless ancestor and page orientation.
 
-        Nonorthogonal ancestor transforms need a composite resource crop for
-        display; native extraction still retains the individual source pixels.
+        Unsupported image or ancestor components raise RecognitionFailure.
+        Use resource() to retain their correctly placed composite rendering.
         """
         page = self._page(image.page)
         objects = list(page.get_objects(filter=[pdfium_raw.FPDF_PAGEOBJ_IMAGE]))
         obj = objects[image.object_index]
+        supported, orientation = _native_extraction_orientation(obj)
+        if not supported:
+            from marker.cloud.context import RecognitionFailure
+            raise RecognitionFailure("Native raster placement requires composite source rendering")
         bitmap = obj.get_bitmap(render=True, scale_to_original=True)
         try:
             pixels = bitmap.to_pil().copy()
         finally:
             bitmap.close()
-        supported, orientation = _native_transpose(_ancestor_matrix(obj))
-        if supported and orientation is not None:
+        if orientation is not None:
             pixels = pixels.transpose(orientation)
         rotation = page.get_rotation()
         transpose = {90: Image.Transpose.ROTATE_270, 180: Image.Transpose.ROTATE_180,
@@ -347,7 +361,12 @@ class PdfSource:
         x0, y0, x1, y1 = bbox
         scale = dpi/72
         left, top = floor(x0*scale), floor(y0*scale)
-        pixel_width, pixel_height = max(1, ceil((x1-x0)*scale-1e-9)), max(1, ceil((y1-y0)*scale-1e-9))
+        # PDFium matrices use float32 while pdfplumber coordinates use Python
+        # floats. Ignore their tiny boundary drift, capped at 0.001 pixel,
+        # without changing source coordinates or the retained raster DPI.
+        spans = ((x1-x0)*scale, (y1-y0)*scale)
+        pixel_width, pixel_height = (max(1, ceil(span-min(1e-3, max(1e-9, span*1e-7))))
+                                     for span in spans)
         cuts = (left, ceil(height*scale)-top-pixel_height,
                 ceil(width*scale)-left-pixel_width, top)
         # PDFium rounds each cut separately. Choose integer pixel cuts first
@@ -419,7 +438,7 @@ class PdfSource:
         box, page = image.bbox, image.page
         objects = list(self._page(page).get_objects(filter=[pdfium_raw.FPDF_PAGEOBJ_IMAGE]))
         obj = objects[image.object_index]
-        supported, _ = _native_transpose(obj.get_matrix().multiply(_ancestor_matrix(obj)))
+        supported, _ = _native_extraction_orientation(obj)
         if not supported:
             return False
         if self.page_words(page, box) or any(other.index != image.index and

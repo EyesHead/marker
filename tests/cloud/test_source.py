@@ -36,6 +36,9 @@ class PdfSourceTests(unittest.TestCase):
             pixels = source.crop(0, (40, 220, 112, 256), dpi=600)
             self.assertEqual(pixels.size, (600, 300))
             self.assertLess(pixels.convert("L").getextrema()[0], 100)
+            fractional = source.crop(0, (40, 50, 112.0001, 86), dpi=600)
+            self.assertEqual(fractional.size, (601, 300), "Real fractional extent must still round up")
+            self.assertEqual(fractional.getpixel((600, 150)), (10, 40, 90), "Keep visible edge pixels")
             with self.assertRaises(ValueError):
                 source.crop(0, (0, 0, 0, 12), dpi=600)
             with self.assertRaises(ValueError):
@@ -149,6 +152,39 @@ class PdfSourceTests(unittest.TestCase):
             resource = source.resource(1, image.bbox)
             self.assertGreaterEqual(resource.width, 893)
             self.assertGreaterEqual(resource.height, 747)
+
+    def test_cancelled_component_rotations_keep_resource_rectangle_and_provenance(self):
+        from marker.cloud.context import RecognitionFailure
+        with self.PdfSource(FIXTURES / "form_instances.pdf") as source:
+            original = source.page_images(3)
+            self.assertEqual(len(original), 1)
+            image = original[0]
+            self.assertEqual((image.width, image.height), (800, 400))
+            for actual, expected in zip(image.bbox, (180, 160, 260, 200)):
+                self.assertAlmostEqual(actual, expected, places=3)
+            resource = source.resource(3, image.bbox)
+            with self.subTest(check='dimensions'):
+                self.assertEqual(resource.size, (800, 400))
+            with self.subTest(check='opaque composite'):
+                self.assertEqual(resource.mode, 'RGB')
+            corners = [(resource.width*x//10, resource.height*y//10)
+                       for x, y in ((1, 1), (9, 1), (1, 9), (9, 9))]
+            colors = [(10, 40, 90), (180, 20, 35), (10, 40, 90), (180, 20, 35)]
+            with self.subTest(check='corner colors'):
+                self.assertEqual([resource.getpixel(point) for point in corners], colors)
+            with self.subTest(check='native compatibility'):
+                self.assertFalse(source.isolated_image(image))
+            with self.subTest(check='explicit unsupported extraction'):
+                with self.assertRaisesRegex(RecognitionFailure, 'composite'):
+                    source.extract_image(image)
+            region = self.analyze_page(source, 3)[0]
+            with self.subTest(check='composite region'):
+                self.assertIsNone(region.image)
+            self.assertEqual(region.atoms[0]['source_bbox'], image.bbox)
+            self.assertEqual(region.atoms[0]['source_page'], 3)
+            self.assertEqual(source.page_images(3), original)
+        with self.subTest(check='pixel lifetime'):
+            self.assertEqual([resource.getpixel(point) for point in corners], colors)
 
     def test_form_image_instances_compose_nested_placements_and_preserve_native_pixels(self):
         with self.PdfSource(FIXTURES / "form_instances.pdf") as source:

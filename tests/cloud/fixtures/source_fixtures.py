@@ -330,6 +330,18 @@ def form_instances(path):
     reader = PdfReader(BytesIO(Path(path).read_bytes()))
     writer = PdfWriter(clone_from=reader)
     writer.add_page(reader.pages[0]).rotate(90)
+    cancelled = BytesIO()
+    placement = canvas_at(cancelled, "Synthetic cancelling image and Form rotations")
+    placement.beginForm("cancelled", -100, -100, 150, 150)
+    placement.rotate(30)
+    placement.drawImage(ImageReader(pixels), 0, 0, width=80, height=40)
+    placement.endForm()
+    placement.translate(180, 200)
+    placement.rotate(-30)
+    placement.doForm("cancelled")
+    placement.showPage()
+    placement.save()
+    writer.add_page(PdfReader(BytesIO(cancelled.getvalue())).pages[0])
     writer._ID = reader.trailer["/ID"]
     writer.write(path)
 
