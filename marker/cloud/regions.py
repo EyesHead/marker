@@ -135,14 +135,30 @@ def analyze_page(source, page) -> list[Region]:
             group.extend(existing)
             image_groups.remove(existing)
         image_groups.append(group)
-    for group in image_groups:
+    table_words = {(atom.get('text'), tuple(atom['bbox'])) for region in regions
+                   for atom in region.atoms if atom['kind'] == 'text'}
+    owned_words = {index for index, word in enumerate(words)
+                   if (word['text'], tuple(word['bbox'])) in table_words}
+    image_boxes = [_bounds([{'bbox': image.bbox} for image in group]) for group in image_groups]
+    overlays = [[] for _ in image_groups]
+    for index, word in enumerate(words):
+        if index in owned_words or not image_boxes:
+            continue
+        owner = max(range(len(image_boxes)), key=lambda group: intersection(word['bbox'], image_boxes[group]))
+        if intersection(word['bbox'], image_boxes[owner]) > 0:
+            overlays[owner].append(word)
+            owned_words.add(index)
+    for index, group in enumerate(image_groups):
         atoms = [{"kind": "image", "bbox": image.bbox, "source_bbox": image.bbox,
                   "source_page": page, "image_index": image.index} for image in group]
+        atoms.extend(overlays[index])
+        # Assigned words can cross the raster edge. The composite crop must
+        # include every assigned atom, and ownership must not depend on a
+        # coverage threshold or the rectangular gaps in other region boxes.
         box = _bounds(atoms)
-        atoms.extend(word for word in words if intersection(word["bbox"], box) > 0 and not covered(word["bbox"]))
-        image = group[0] if len(group) == 1 and source.isolated_image(group[0]) else None
+        image = group[0] if len(group) == 1 and not overlays[index] and source.isolated_image(group[0]) else None
         regions.append(Region(page, box, "image", tuple(atoms), source.text_quality(page, box), image=image))
-    remaining = [word for word in words if not covered(word["bbox"])]
+    remaining = [word for index, word in enumerate(words) if index not in owned_words]
     paragraphs = []
     for row in word_lines(remaining):
         box = _bounds(row)

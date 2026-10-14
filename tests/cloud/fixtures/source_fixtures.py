@@ -297,6 +297,52 @@ def open_neighbours(path):
     canvas.save()
 
 
+def form_instances(path):
+    canvas = canvas_at(path, "Synthetic nested and reused native-image forms")
+    pixels = Image.new("RGB", (800, 400), (10, 40, 90))
+    ImageDraw.Draw(pixels).rectangle((400, 0, 799, 399), fill=(180, 20, 35))
+    canvas.beginForm("inner", 0, 0, 80, 40)
+    canvas.drawImage(ImageReader(pixels), 0, 0, width=80, height=40)
+    canvas.endForm()
+    canvas.beginForm("outer", 0, 0, 100, 80)
+    canvas.saveState()
+    canvas.translate(20, 10)
+    canvas.scale(0.5, 0.5)
+    canvas.doForm("inner")
+    canvas.restoreState()
+    canvas.endForm()
+    for x, y, sx, sy, rotation in ((120, 200, 1, 1, 0), (220, 80, 2, 1, 0), (80, 260, 1, 1, 90)):
+        canvas.saveState()
+        canvas.translate(x, y)
+        canvas.scale(sx, sy)
+        canvas.rotate(rotation)
+        canvas.doForm("outer")
+        canvas.restoreState()
+    text(canvas, 145, 175, "A")
+    canvas.showPage()
+    canvas.saveState()
+    canvas.translate(180, 200)
+    canvas.rotate(30)
+    canvas.drawImage(ImageReader(pixels), 0, 0, width=80, height=40)
+    canvas.restoreState()
+    canvas.showPage()
+    canvas.save()
+    reader = PdfReader(BytesIO(Path(path).read_bytes()))
+    writer = PdfWriter(clone_from=reader)
+    writer.add_page(reader.pages[0]).rotate(90)
+    writer._ID = reader.trailer["/ID"]
+    writer.write(path)
+
+
+def crossing_overlay(path):
+    canvas = canvas_at(path, "Synthetic text crossing a native raster boundary")
+    pixels = Image.new("RGB", (800, 400), (10, 40, 90))
+    image(canvas, pixels, (40, 50, 200, 130))
+    text(canvas, 190, 90, "OVERLAY")
+    canvas.showPage()
+    canvas.save()
+
+
 def generate(directory):
     rl_config.useA85 = False
     directory = Path(directory)
@@ -306,7 +352,8 @@ def generate(directory):
                   "unrelated_tables": unrelated, "borderless_tables": borderless,
                   "ambiguous_tables": ambiguous, "rotated_crop": rotated_crop,
                   "refined_header": refined_header, "conflicting_captions": conflicting_captions,
-                  "image_layers": image_layers, "open_neighbours": open_neighbours}
+                  "image_layers": image_layers, "open_neighbours": open_neighbours,
+                  "form_instances": form_instances, "crossing_overlay": crossing_overlay}
     for name, generator in generators.items():
         generator(directory / f"{name}.pdf")
 

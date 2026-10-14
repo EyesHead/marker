@@ -103,7 +103,7 @@ class PdfSourceTests(unittest.TestCase):
             self.assertIsNone(regions[0].image, "A composite must use its source crop")
             self.assertEqual(len([atom for atom in regions[0].atoms if atom["kind"] == "image"]), 2)
             self.assertIn("OVERLAY", [atom.get("text") for atom in regions[0].atoms])
-            composite = source.resource(0, images[0].bbox, dpi=72)
+            composite = source.crop(0, images[0].bbox, dpi=72)
             self.assertEqual(composite.size, (160, 80))
             self.assertEqual(composite.getpixel((100, 10))[:3], (10, 40, 90))
 
@@ -111,8 +111,93 @@ class PdfSourceTests(unittest.TestCase):
         with self.PdfSource(FIXTURES / "image_layers.pdf") as source:
             image = source.page_images(1)[0]
             resource = source.resource(1, image.bbox, dpi=72)
-            self.assertEqual(resource.size, (160, 80))
-            self.assertLess(resource.getpixel((100, 40))[0], 10)
+            self.assertEqual(resource.size, (2048, 1024))
+            self.assertLess(resource.getpixel((100, 512))[0], 10)
+            diagnostic = source.crop(1, image.bbox, dpi=72)
+            self.assertEqual(diagnostic.size, (160, 80))
+            self.assertLess(diagnostic.getpixel((100, 40))[0], 10)
+
+    def test_default_composite_resources_keep_native_sampling_before_request_copies(self):
+        from marker.cloud.context import fit_request
+        with self.PdfSource(FIXTURES / "image_layers.pdf") as source:
+            for page in (0, 1):
+                with self.subTest(page=page):
+                    image = source.page_images(page)[0]
+                    resource = source.resource(page, image.bbox)
+                    self.assertGreaterEqual(resource.width, 2048)
+                    self.assertGreaterEqual(resource.height, 1024)
+                    original = resource.size
+                    request_copy = fit_request('figure', [resource], 8192, 2048)[0]
+                    self.assertLessEqual(max(request_copy.size), 1536)
+                    self.assertEqual(resource.size, original)
+
+    def test_composite_resource_density_includes_form_and_page_transforms(self):
+        with self.PdfSource(FIXTURES / "form_instances.pdf") as source:
+            for page, bbox, native_size in ((0, (140, 170, 180, 190), (800, 400)),
+                                            (2, (210, 140, 230, 180), (400, 800))):
+                with self.subTest(page=page):
+                    image = next(image for image in source.page_images(page) if image.bbox == bbox)
+                    self.assertFalse(source.isolated_image(image), 'The A overlay requires a composite resource')
+                    resource = source.resource(page, image.bbox)
+                    self.assertGreaterEqual(resource.width, native_size[0])
+                    self.assertGreaterEqual(resource.height, native_size[1])
+
+    def test_tilted_native_resource_preserves_sampling_through_composite_rendering(self):
+        with self.PdfSource(FIXTURES / "form_instances.pdf") as source:
+            image = source.page_images(1)[0]
+            self.assertFalse(source.isolated_image(image))
+            resource = source.resource(1, image.bbox)
+            self.assertGreaterEqual(resource.width, 893)
+            self.assertGreaterEqual(resource.height, 747)
+
+    def test_form_image_instances_compose_nested_placements_and_preserve_native_pixels(self):
+        with self.PdfSource(FIXTURES / "form_instances.pdf") as source:
+            images = source.page_images(0)
+            self.assertEqual(len(images), 3)
+            self.assertCountEqual([image.bbox for image in images],
+                                  [(140, 170, 180, 190), (260, 290, 340, 310), (50, 80, 70, 120)])
+            self.assertEqual(len({image.object_index for image in images}), 3)
+            retained = []
+            for image in images:
+                self.assertEqual((image.width, image.height), (800, 400))
+                retained.append(source.resource(0, image.bbox))
+                if image.bbox == (50, 80, 70, 120):
+                    self.assertEqual(retained[-1].size, (400, 800))
+                    self.assertEqual(retained[-1].getpixel((100, 100))[:3], (180, 20, 35))
+                    self.assertEqual(retained[-1].getpixel((100, 700))[:3], (10, 40, 90))
+                else:
+                    self.assertEqual(retained[-1].size, (800, 400))
+                    self.assertEqual(retained[-1].getpixel((100, 100))[:3], (10, 40, 90))
+                    self.assertEqual(retained[-1].getpixel((700, 100))[:3], (180, 20, 35))
+                crop = source.crop(0, image.bbox, dpi=72)
+                self.assertLess(crop.convert('L').getextrema()[0], 100)
+            self.assertEqual(source.page_images(0), images, "Native extraction must not alter source placement")
+            self.assertEqual(len(self.analyze_page(source, 0)), 3)
+        self.assertTrue(all(image.convert('L').getextrema()[0] < 100 for image in retained))
+
+    def test_crossing_overlay_has_one_owner_and_complete_composite_crop(self):
+        with self.PdfSource(FIXTURES / "crossing_overlay.pdf") as source:
+            regions = self.analyze_page(source, 0)
+            owners = [(region, atom) for region in regions for atom in region.atoms
+                      if atom.get('text') == 'OVERLAY']
+            self.assertEqual(len(owners), 1)
+            self.assertEqual(len(regions), 1)
+            region, word = owners[0]
+            self.assertEqual(region.kind, 'image')
+            self.assertIsNone(region.image)
+            self.assertEqual(region.bbox[:2], (40, 50))
+            self.assertAlmostEqual(region.bbox[2], 237.24)
+            self.assertEqual(region.bbox[3], 130)
+            for atom in region.atoms:
+                self.assertGreaterEqual(atom['bbox'][0], region.bbox[0])
+                self.assertGreaterEqual(atom['bbox'][1], region.bbox[1])
+                self.assertLessEqual(atom['bbox'][2], region.bbox[2])
+                self.assertLessEqual(atom['bbox'][3], region.bbox[3])
+            pixels = source.crop(0, region.bbox, dpi=72)
+            self.assertEqual(pixels.size, (198, 80))
+            right = pixels.crop((pixels.width-30, 40, pixels.width, 60))
+            self.assertLess(right.convert('L').getextrema()[0], 100)
+            self.assertEqual(word['source_bbox'], word['bbox'])
 
     def test_scan_has_untrusted_full_page_region_and_native_image(self):
         with self.PdfSource(FIXTURES / "scan.pdf") as source:

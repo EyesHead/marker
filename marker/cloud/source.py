@@ -7,7 +7,7 @@ metadata all use that same basis. Request sizing belongs to CloudClient.
 
 from contextlib import ExitStack
 from dataclasses import dataclass
-from math import ceil, floor, isfinite
+from math import ceil, floor, hypot, isfinite
 from pathlib import Path
 
 import pdfplumber
@@ -36,6 +36,33 @@ def _rotate_bbox(box, width, height, rotation):
     if rotation == 270:
         return y0, width-x1, y1, width-x0
     return tuple(box)
+
+
+def _ancestor_matrix(obj):
+    """Compose this placed instance's containing forms, from inner to outer."""
+    matrix = pdfium.PdfMatrix()
+    parent = obj.container
+    while parent is not None:
+        matrix = matrix.multiply(parent.get_matrix())
+        parent = parent.container
+    return matrix
+
+
+def _native_transpose(matrix):
+    """Lossless orientation for axis-aligned placements, excluding resampling."""
+    a, b, c, d, _, _ = matrix.get()
+    tolerance = max(1, abs(a), abs(b), abs(c), abs(d))*1e-7
+    if abs(b) <= tolerance and abs(c) <= tolerance and a*d != 0:
+        orientation = (Image.Transpose.ROTATE_180 if a < 0 and d < 0 else
+                       Image.Transpose.FLIP_LEFT_RIGHT if a < 0 else
+                       Image.Transpose.FLIP_TOP_BOTTOM if d < 0 else None)
+        return True, orientation
+    if abs(a) <= tolerance and abs(d) <= tolerance and b*c != 0:
+        orientation = (Image.Transpose.ROTATE_90 if b > 0 and c < 0 else
+                       Image.Transpose.ROTATE_270 if b < 0 and c > 0 else
+                       Image.Transpose.TRANSVERSE if b > 0 else Image.Transpose.TRANSPOSE)
+        return True, orientation
+    return False, None
 
 
 @dataclass(frozen=True)
@@ -247,7 +274,14 @@ class PdfSource:
                  (word['width'] <= 0 or word['height'] <= 0))]
 
     def _image_bounds(self, page, obj):
-        return self._pdfium_box(page, obj.get_bounds())
+        # PDFium child bounds include the image's own matrix, but omit every
+        # containing Form's matrix. The container chain is instance-specific,
+        # even when the PDF reuses the same Form stream at several placements.
+        matrix = _ancestor_matrix(obj)
+        points = [matrix.on_point(*point) for point in obj.get_quad_points()]
+        box = (min(point[0] for point in points), min(point[1] for point in points),
+               max(point[0] for point in points), max(point[1] for point in points))
+        return self._pdfium_box(page, box)
 
     def page_images(self, page, bbox=None) -> list[NativeImage]:
         pdf_page = self._page(page)
@@ -274,7 +308,11 @@ class PdfSource:
         return [image for image in self._images[page] if bbox is None or intersection(image.bbox, bbox) > 0]
 
     def extract_image(self, image: NativeImage) -> Image.Image:
-        """Decode source pixels and masks; retain resolution and page orientation."""
+        """Decode pixels/masks; apply lossless ancestor and page orientation.
+
+        Nonorthogonal ancestor transforms need a composite resource crop for
+        display; native extraction still retains the individual source pixels.
+        """
         page = self._page(image.page)
         objects = list(page.get_objects(filter=[pdfium_raw.FPDF_PAGEOBJ_IMAGE]))
         obj = objects[image.object_index]
@@ -283,6 +321,9 @@ class PdfSource:
             pixels = bitmap.to_pil().copy()
         finally:
             bitmap.close()
+        supported, orientation = _native_transpose(_ancestor_matrix(obj))
+        if supported and orientation is not None:
+            pixels = pixels.transpose(orientation)
         rotation = page.get_rotation()
         transpose = {90: Image.Transpose.ROTATE_270, 180: Image.Transpose.ROTATE_180,
                      270: Image.Transpose.ROTATE_90}
@@ -319,7 +360,12 @@ class PdfSource:
             bitmap.close()
 
     def resource(self, page, bbox, dpi=None) -> Image.Image:
-        """Use native pixels for an isolated raster; render composite/vector crops."""
+        """Retain native detail, including in composites with text/vector content.
+
+        ``dpi`` may raise the retained-resource sampling. Use crop() for a
+        deliberately smaller request/diagnostic image; resource() never lowers
+        the configured vector DPI or an intersecting raster's native density.
+        """
         dpi = self.crop_dpi if dpi is None else dpi
         self._valid_crop(page, bbox, dpi)
         exact = [image for image in self.page_images(page) if all(
@@ -335,11 +381,47 @@ class PdfSource:
                     (bbox[0]-full[0])*sx, (bbox[1]-full[1])*sy,
                     (bbox[2]-full[0])*sx, (bbox[3]-full[1])*sy)))
             return pixels
-        return self.crop(page, bbox, dpi=dpi)
+        return self.crop(page, bbox, dpi=max(self.crop_dpi, dpi, self._raster_dpi(page, bbox)))
+
+    def _raster_dpi(self, page, bbox):
+        """Maximum pixel/point density through image and ancestor transforms.
+
+        The largest singular value of the inverse pixel placement accounts
+        for anisotropic scaling/shear as well as rotation. Page rotation is
+        orthogonal, so it does not change this density. Raising sample counts
+        on a stretched axis preserves detail; it does not invent new detail.
+        """
+        objects = list(self._page(page).get_objects(filter=[pdfium_raw.FPDF_PAGEOBJ_IMAGE]))
+        density = 0.0
+        for image in self.page_images(page, bbox):
+            obj = objects[image.object_index]
+            matrix = obj.get_matrix().multiply(_ancestor_matrix(obj))
+            a, b, c, d, _, _ = matrix.get()
+            determinant = a*d-b*c
+            if determinant == 0:
+                from marker.cloud.context import RecognitionFailure
+                raise RecognitionFailure("Native raster placement has no usable area")
+            q = (image.width*d/determinant, -image.width*c/determinant,
+                 -image.height*b/determinant, image.height*a/determinant)
+            # Stable closed form for the largest singular value of a 2x2
+            # matrix. Unlike subtracting nearly equal squared traces, this
+            # does not add a spurious pixel for uniform native sampling.
+            native = (hypot(q[0]+q[3], q[1]-q[2]) +
+                      hypot(q[0]-q[3], q[1]+q[2]))*36
+            if not isfinite(native):
+                from marker.cloud.context import RecognitionFailure
+                raise RecognitionFailure("Native raster placement density is not finite")
+            density = max(density, native)
+        return density
 
     def isolated_image(self, image: NativeImage) -> bool:
         """Whether native extraction alone reproduces this displayed rectangle."""
         box, page = image.bbox, image.page
+        objects = list(self._page(page).get_objects(filter=[pdfium_raw.FPDF_PAGEOBJ_IMAGE]))
+        obj = objects[image.object_index]
+        supported, _ = _native_transpose(obj.get_matrix().multiply(_ancestor_matrix(obj)))
+        if not supported:
+            return False
         if self.page_words(page, box) or any(other.index != image.index and
                                              intersection(other.bbox, box) > 0 for other in self.page_images(page)):
             return False
