@@ -76,6 +76,7 @@ class TableProcessor(BaseProcessor):
         self.table_stats = Counter()
 
     def __call__(self, document: Document):
+        self.table_stats.clear()
         self.prepare_geometry_tables(document)
         tables_by_page = self.collect_tables(document)
         total = sum(len(v) for v in tables_by_page.values())

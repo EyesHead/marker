@@ -3,22 +3,29 @@
 import json
 import tempfile
 import unittest
+from collections import Counter
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 import httpx
 import openai
+import pdfplumber
+import pypdfium2 as pdfium
 from bs4 import BeautifulSoup
 from PIL import Image
 
 from marker.output import save_output
 from marker.processors.llm.llm_table import LLMTableProcessor, TableSchema
 from marker.processors.llm.llm_table_merge import LLMTableMergeProcessor
+from marker.processors.llm.llm_mathblock import LLMMathBlockProcessor
+from marker.processors.table import TableProcessor
 from marker.renderers.markdown import MarkdownRenderer
-from marker.schema.blocks import Table, TableCell
+from marker.schema import BlockTypes
+from marker.schema.blocks import InlineMath, Table, TableCell, Text
 from marker.schema.document import Document
 from marker.schema.groups.page import PageGroup
 from marker.schema.polygon import PolygonBox
+from marker.schema.text.line import Line
 from marker.services.openai import OpenAIService
 
 
@@ -32,6 +39,96 @@ def page_with_table(page_id, bbox, html=None):
 
 
 class HTMLTableTests(unittest.TestCase):
+    def test_125_pdf_rows_remain_unique_across_three_rewrite_batches(self):
+        fixture = Path(__file__).parents[1] / 'cloud' / 'fixtures' / 'rows_125.pdf'
+        with pdfplumber.open(fixture) as source:
+            extracted = source.pages[0].find_tables()[0]
+            rows = extracted.extract()
+            boxes = [row.cells for row in extracted.rows]
+            bbox = extracted.bbox
+            width, height = source.pages[0].width, source.pages[0].height
+        self.assertEqual(rows[0], ['0', 'value-000'])
+        self.assertEqual(rows[-1], ['124', 'value-124'])
+        self.assertEqual(len(rows), 125)
+        with pdfium.PdfDocument(fixture) as source:
+            pdf_page = source[0]
+            bitmap = pdf_page.render(scale=1)
+            image = bitmap.to_pil().copy()
+            bitmap.close()
+            pdf_page.close()
+        page = PageGroup(page_id=0, polygon=PolygonBox.from_bbox([0, 0, width, height]),
+                         children=[], structure=[], lowres_image=image, highres_image=image)
+        table = page.add_full_block(Table(page_id=0, polygon=PolygonBox.from_bbox(bbox)))
+        page.add_structure(table)
+        for row_id, (values, cell_boxes) in enumerate(zip(rows, boxes)):
+            for col_id, (value, cell_bbox) in enumerate(zip(values, cell_boxes)):
+                cell = page.add_full_block(TableCell(
+                    page_id=0, polygon=PolygonBox.from_bbox(cell_bbox),
+                    rowspan=1, colspan=1, row_id=row_id, col_id=col_id,
+                    is_header=False, text_lines=[value]))
+                table.add_structure(cell)
+        document = Document(filepath=str(fixture), pages=[page])
+        def respond(request):
+            payload = json.loads(request.content)
+            prompt = payload['messages'][0]['content'][-1]['text']
+            html = prompt.rsplit('**Input:**', 1)[1].split('```html\n', 1)[1].split('```', 1)[0].strip()
+            content = {'comparison': 'PDF cells match', 'corrected_html': html,
+                       'analysis': 'All source cells retained', 'score': 5}
+            return httpx.Response(200, json={
+                'id': 'offline', 'object': 'chat.completion', 'created': 0,
+                'model': 'gemma4:31b', 'usage': None,
+                'choices': [{'index': 0, 'finish_reason': 'stop', 'message': {
+                    'role': 'assistant', 'content': json.dumps(content)}}]})
+        client = openai.OpenAI(api_key='offline-placeholder', base_url='https://ollama.com/v1',
+                               http_client=httpx.Client(transport=httpx.MockTransport(respond)))
+        service = OpenAIService({'openai_base_url': 'https://ollama.com/v1',
+                                 'openai_api_key': 'offline-placeholder', 'openai_model': 'gemma4:31b'})
+        processor = LLMTableProcessor(service, {'use_llm': True, 'image_expansion_ratio': 0})
+        source_cells = table.contained_blocks(document, (BlockTypes.TableCell,))
+        source_bboxes = [cell.polygon.bbox[:] for cell in source_cells]
+        with client, patch.object(service, 'get_client', return_value=client):
+            processor.process_rewriting(document, page, table)
+        self.assertEqual(table.metadata.llm_request_count, 3)
+        self.assertEqual(table.metadata.llm_error_count, 0)
+        self.assertEqual([cell.polygon.bbox for cell in source_cells], source_bboxes)
+        cells = table.contained_blocks(document, (BlockTypes.TableCell,))
+        self.assertEqual(sorted({cell.row_id for cell in cells}), list(range(125)))
+        self.assertEqual(Counter(cell.row_id for cell in cells), {row: 2 for row in range(125)})
+        self.assertEqual([cell.text for cell in cells], [value for row in rows for value in row])
+
+    def test_inline_math_candidates_are_rewritten_once(self):
+        page, table = page_with_table(0, [100, 100, 900, 900])
+        page.structure = []
+        inline = page.add_full_block(InlineMath(page_id=0, polygon=table.polygon,
+                                                html='<p>x = 1</p>'))
+        text = page.add_full_block(Text(page_id=0, polygon=table.polygon,
+                                        html='<p>y = 2</p>'))
+        line = page.add_full_block(Line(page_id=0, polygon=table.polygon, formats=['math']))
+        text.add_structure(line)
+        page.add_structure(inline)
+        page.add_structure(text)
+        document = Document(filepath='offline.pdf', pages=[page])
+        rewritten = []
+        def recognize(prompt, image, block, schema):
+            rewritten.append(block.id)
+            return {'analysis': 'Source matches', 'corrected_html': 'No corrections needed'}
+        processor = LLMMathBlockProcessor(recognize, {'use_llm': True, 'redo_inline_math': True,
+                                                       'disable_tqdm': True, 'max_concurrency': 1})
+        processor.rewrite_blocks(document)
+        self.assertEqual(Counter(rewritten), {inline.id: 1, text.id: 1})
+
+    def test_table_statistics_reset_for_each_document(self):
+        processor = TableProcessor(None, {'table_geometry': False, 'disable_ocr': True})
+        for index in range(2):
+            page, _ = page_with_table(0, [100, 100, 900, 900],
+                                       '<table><tr><td>1</td><td>2</td></tr></table>')
+            with self.assertLogs('marker', level='INFO'):
+                processor(Document(filepath=f'offline-{index}.pdf', pages=[page]))
+            self.assertEqual(processor.table_stats['tables_ocr'], 1)
+            self.assertEqual(processor.table_stats['tables_total'], 1)
+        processor(Document(filepath='empty.pdf', pages=[]))
+        self.assertEqual(dict(processor.table_stats), {})
+
     def test_model_image_boxes_become_cell_resources_and_latex_survives(self):
         page, table = page_with_table(0, [100, 100, 900, 900], '<table><tr><td>А</td><td>Б</td></tr></table>')
         document = Document(filepath='offline.pdf', pages=[page])

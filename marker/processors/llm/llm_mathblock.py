@@ -111,6 +111,7 @@ Adversarial training <i>(AT)</i> <a href='#page-9-1'>[23]</a>, which aims to min
 
         # If a page has enough math blocks, assume all blocks can contain math
         additional_text_blocks = []
+        selected_ids = {block.id for _, block in inline_blocks + detected_blocks}
         for page in document.pages:
             # Check for inline math blocks
             page_inlinemath_blocks = [
@@ -134,8 +135,9 @@ Adversarial training <i>(AT)</i> <a href='#page-9-1'>[23]</a>, which aims to min
                 continue
 
             for b in additional_blocks:
-                if b not in detected_blocks and b not in inline_blocks:
+                if b.id not in selected_ids:
                     additional_text_blocks.append((page, b))
+                    selected_ids.add(b.id)
 
         inference_blocks = inline_blocks + detected_blocks + additional_text_blocks
 

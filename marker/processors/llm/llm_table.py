@@ -180,10 +180,13 @@ score: 5
             if batch_parsed_cells is None:
                 return  # Error occurred or no corrections needed
 
+            next_row_shift = row_shift + max(
+                cell.row_id + cell.rowspan for cell in batch_parsed_cells
+            )
             for cell in batch_parsed_cells:
                 cell.row_id += row_shift
                 parsed_cells.append(cell)
-            row_shift += max([cell.row_id for cell in batch_parsed_cells])
+            row_shift = next_row_shift
 
         block.structure = []
         for cell in parsed_cells:

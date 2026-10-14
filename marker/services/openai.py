@@ -1,4 +1,3 @@
-import json
 import os
 import time
 from typing import Annotated, List
@@ -7,10 +6,18 @@ from urllib.parse import urlparse
 import openai
 import PIL
 from marker.logger import get_logger
-from openai import APITimeoutError, RateLimitError
 from PIL import Image
 from pydantic import BaseModel, ValidationError
 
+from marker.cloud.client import (
+    ResponseValidationError,
+    provider_error_reason,
+    repair_prompt,
+    retryable_provider_error,
+    schema_error_reason,
+    schema_prompt,
+    validate_response,
+)
 from marker.schema.blocks import Block
 from marker.services import BaseService
 
@@ -75,76 +82,68 @@ class OpenAIService(BaseService):
         if timeout is None:
             timeout = self.timeout
 
-        client = self.get_client()
+        try:
+            client = self.get_client()
+        except Exception:
+            logger.error("OpenAI client initialization failed")
+            return {}
         image_data = self.format_image_for_llm(image)
-
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    *image_data,
-                    {"type": "text", "text": prompt},
-                ],
-            }
-        ]
+        is_cloud = urlparse(self.openai_base_url).hostname == "ollama.com"
+        original_prompt = schema_prompt(prompt, response_schema) if is_cloud else prompt
+        current_prompt = original_prompt
 
         total_tries = max_retries + 1
         for tries in range(1, total_tries + 1):
+            messages = [{"role": "user", "content": [
+                *image_data, {"type": "text", "text": current_prompt},
+            ]}]
             try:
+                if block:
+                    block.update_metadata(llm_request_count=1)
                 # Ollama Cloud does not enforce JSON Schema / structured outputs.
                 # Include the schema in the request and validate locally instead.
-                if urlparse(self.openai_base_url).hostname == "ollama.com":
-                    schema_prompt = (prompt + "\n\nReturn only JSON matching this schema:\n"
-                                     + json.dumps(response_schema.model_json_schema(), ensure_ascii=False))
-                    cloud_messages = [{"role": "user", "content": [*image_data, {"type": "text", "text": schema_prompt}]}]
+                if is_cloud:
                     options = {"max_tokens": self.max_output_tokens} if self.max_output_tokens else {}
                     response = client.chat.completions.create(
-                        model=self.openai_model, messages=cloud_messages,
+                        model=self.openai_model, messages=messages,
                         timeout=timeout, temperature=0, **options,
                     )
-                    if response.choices[0].finish_reason == "length":
-                        raise ValueError("Cloud response was truncated before completing the JSON")
                 else:
                     response = client.chat.completions.parse(
                         extra_headers={"X-Title": "Marker", "HTTP-Referer": "https://github.com/datalab-to/marker"},
                         model=self.openai_model, messages=messages, timeout=timeout,
                         response_format=response_schema,
                     )
-                response_text = response.choices[0].message.content
                 total_tokens = response.usage.total_tokens if response.usage else 0
                 if block:
-                    block.update_metadata(
-                        llm_tokens_used=total_tokens, llm_request_count=1
-                    )
-                # Some providers wrap JSON in one code fence despite the prompt.
-                response_text = (response_text or "").strip()
-                if response_text.startswith("```json\n") and response_text.endswith("```"):
-                    response_text = response_text[8:-3].strip()
-                try:
-                    return response_schema.model_validate_json(response_text).model_dump()
-                except ValidationError as error:
-                    errors = [f'{e["loc"]}: {e["msg"]}' for e in error.errors(include_input=False)]
-                    logger.warning("LLM response failed schema validation (%d errors)", len(errors))
-                    return {}
-            except (APITimeoutError, RateLimitError) as e:
-                # Rate limit exceeded
+                    block.update_metadata(llm_tokens_used=total_tokens)
+                if not response.choices:
+                    raise ResponseValidationError("Response contains no completion")
+                choice = response.choices[0]
+                return validate_response(choice.message.content, response_schema, choice.finish_reason)
+            except (ResponseValidationError, ValidationError, openai.LengthFinishReasonError) as error:
+                if isinstance(error, ValidationError):
+                    reason = schema_error_reason(error, response_schema)
+                elif isinstance(error, openai.LengthFinishReasonError):
+                    reason = "Response was truncated; regenerate complete JSON"
+                else:
+                    reason = str(error)
+                logger.warning("LLM response failed validation: %s (attempt %d/%d)", reason, tries, total_tries)
+                current_prompt = repair_prompt(original_prompt, reason)
+            except Exception as error:
+                reason = provider_error_reason(error)
+                if not retryable_provider_error(error):
+                    logger.error("OpenAI inference failed: %s", reason)
+                    break
                 if tries == total_tries:
-                    # Last attempt failed. Give up
-                    logger.error(
-                        f"Rate limit error: {e}. Max retries reached. Giving up. (Attempt {tries}/{total_tries})",
-                    )
+                    logger.error("%s. Maximum attempts reached (%d/%d)", reason, tries, total_tries)
                     break
                 else:
                     wait_time = tries * self.retry_wait_time
-                    logger.warning(
-                        f"Rate limit error: {e}. Retrying in {wait_time} seconds... (Attempt {tries}/{total_tries})",
-                    )
+                    logger.warning("%s. Retrying in %s seconds (attempt %d/%d)", reason, wait_time, tries, total_tries)
                     time.sleep(wait_time)
-            except Exception as e:
-                logger.error(f"OpenAI inference failed: {e}")
-                break
 
         return {}
 
     def get_client(self) -> openai.OpenAI:
-        return openai.OpenAI(api_key=self.openai_api_key, base_url=self.openai_base_url)
+        return openai.OpenAI(api_key=self.openai_api_key, base_url=self.openai_base_url, max_retries=0)
