@@ -2343,9 +2343,11 @@ dependencies = [
     { name = "filetype" },
     { name = "ftfy" },
     { name = "google-genai" },
+    { name = "latex2mathml" },
     { name = "markdown2" },
     { name = "markdownify" },
     { name = "openai" },
+    { name = "pdfplumber" },
     { name = "pdftext" },
     { name = "pillow" },
     { name = "psutil" },
@@ -2378,7 +2380,6 @@ dev = [
     { name = "distance" },
     { name = "fastapi" },
     { name = "jupyter" },
-    { name = "latex2mathml" },
     { name = "lxml" },
     { name = "playwright" },
     { name = "pre-commit" },
@@ -2399,11 +2400,13 @@ requires-dist = [
     { name = "filetype", specifier = ">=1.2.0,<2" },
     { name = "ftfy", specifier = ">=6.1.1,<7" },
     { name = "google-genai", specifier = ">=1.40.0,<3" },
+    { name = "latex2mathml", specifier = ">=3.81.0,<4" },
     { name = "mammoth", marker = "extra == 'full'", specifier = ">=1.9.0,<2" },
     { name = "markdown2", specifier = ">=2.5.2,<3" },
     { name = "markdownify", specifier = ">=1.1.0,<2" },
     { name = "openai", specifier = ">=2.2.0,<3" },
     { name = "openpyxl", marker = "extra == 'full'", specifier = ">=3.1.5,<4" },
+    { name = "pdfplumber", specifier = ">=0.11.4,<0.11.10" },
     { name = "pdftext", specifier = ">=0.7.0,<0.8.0" },
     { name = "pillow", specifier = ">=10.1.0,<11" },
     { name = "psutil", specifier = ">=7.0.0,<8" },
@@ -2429,7 +2432,6 @@ dev = [
     { name = "distance", specifier = "==0.1.3" },
     { name = "fastapi", specifier = ">=0.115.4" },
     { name = "jupyter", specifier = ">=1.0.0" },
-    { name = "latex2mathml", specifier = ">=3.77.0" },
     { name = "lxml", specifier = "==5.3.0" },
     { name = "playwright", specifier = ">=1.49.1" },
     { name = "pre-commit", specifier = ">=4.2.0" },
@@ -3495,6 +3497,20 @@ wheels = [
 ]
 
 [[package]]
+name = "pdfplumber"
+version = "0.11.9"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pdfminer-six" },
+    { name = "pillow" },
+    { name = "pypdfium2" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/38/37/9ca3519e92a8434eb93be570b131476cc0a4e840bb39c62ddb7813a39d53/pdfplumber-0.11.9.tar.gz", hash = "sha256:481224b678b2bbdbf376e2c39bf914144eef7c3d301b4a28eebf0f7f6109d6dc", size = 102768 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8b/c8/cdbc975f5b634e249cfa6597e37c50f3078412474f21c015e508bfbfe3c3/pdfplumber-0.11.9-py3-none-any.whl", hash = "sha256:33ec5580959ba524e9100138746e090879504c42955df1b8a997604dd326c443", size = 60045 },
+]
+
+[[package]]
 name = "pdftext"
 version = "0.7.1"
 source = { registry = "https://pypi.org/simple" }
@@ -3510,6 +3526,19 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/b5/48/6c12661234ef71a9349bb1fbdd0259a6d8189376f664492e2c206ab3c397/pdftext-0.7.1.tar.gz", hash = "sha256:7484add28d48d8c04aab0076769f2d626454233de95de00c7b348cb6398045bd", size = 28483 }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d7/5d/997add0ca9f74d77afd9ab355b301a495420ce0b3258bf6954b00aa47465/pdftext-0.7.1-py3-none-any.whl", hash = "sha256:ffb47a36e7f0c9a295e16c0e0a9f6a323026f88416f8045330746604f7212986", size = 29712 },
+]
+
+[[package]]
+name = "pdfminer-six"
+version = "20251230"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "charset-normalizer" },
+    { name = "cryptography" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/46/9a/d79d8fa6d47a0338846bb558b39b9963b8eb2dfedec61867c138c1b17eeb/pdfminer_six-20251230.tar.gz", hash = "sha256:e8f68a14c57e00c2d7276d26519ea64be1b48f91db1cdc776faa80528ca06c1e", size = 8511285 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/65/d7/b288ea32deb752a09aab73c75e1e7572ab2a2b56c3124a5d1eb24c62ceb3/pdfminer_six-20251230-py3-none-any.whl", hash = "sha256:9ff2e3466a7dfc6de6fd779478850b6b7c2d9e9405aa2a5869376a822771f485", size = 6591909 },
 ]
 
 [[package]]

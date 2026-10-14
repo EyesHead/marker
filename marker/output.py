@@ -98,6 +98,19 @@ def save_output(rendered: BaseModel, output_dir: str, fname_base: str):
         f.write(json.dumps(rendered.metadata, indent=2))
 
     for img_name, img in images.items():
-        img = convert_if_not_rgb(img)  # RGBA images can't save as JPG
-        image_format = "PNG" if img_name.lower().endswith(".png") else settings.OUTPUT_IMAGE_FORMAT
+        image_format = (
+            "PNG" if img_name.lower().endswith(".png") else settings.OUTPUT_IMAGE_FORMAT
+        )
+        # Preserve native PNG alpha/palette; JPEG requires RGB request copies.
+        if image_format.upper() != "PNG" or img.mode not in (
+            "1",
+            "L",
+            "LA",
+            "P",
+            "RGB",
+            "RGBA",
+            "I",
+            "I;16",
+        ):
+            img = convert_if_not_rgb(img)
         img.save(os.path.join(output_dir, img_name), image_format)

@@ -39,7 +39,9 @@ def get_formatted_table_text(element):
         elif content.name == "br":
             text.append("<br>")
         elif content.name == "math":
-            text.append("$" + content.text + "$")
+            text.append(
+                str(content) if content.find("semantics") else "$" + content.text + "$"
+            )
         else:
             content_str = escape_dollars(str(content))
             text.append(content_str)
@@ -107,6 +109,11 @@ class Markdownify(MarkdownConverter):
         return f"\n```chem\n{content}\n```\n"
 
     def convert_math(self, el, text, parent_tags):
+        if el.find("semantics") and "table" in parent_tags:
+            return str(el)
+        annotation = el.find("annotation", attrs={"encoding": "application/x-tex"})
+        if annotation is not None:
+            text = annotation.get_text()
         block = el.has_attr("display") and el["display"] == "block"
         if block:
             return (
@@ -129,8 +136,12 @@ class Markdownify(MarkdownConverter):
         if self.html_tables_in_markdown:
             # LaTeX in a raw HTML table must remain readable in Markdown.
             for math in el.find_all("math"):
+                if math.find("semantics"):
+                    continue
                 delimiter = "$$" if math.get("display") == "block" else "$"
-                math.replace_with(NavigableString(f"{delimiter}{math.get_text()}{delimiter}"))
+                math.replace_with(
+                    NavigableString(f"{delimiter}{math.get_text()}{delimiter}")
+                )
             return "\n\n" + str(el) + "\n\n"
 
         total_rows = len(el.find_all("tr"))

@@ -1,13 +1,21 @@
 """Physical table discovery and bounded grouping before content recognition."""
 
+import json
 import re
+from html import escape
+from typing import Literal
 from copy import deepcopy
 from dataclasses import dataclass, field
 from statistics import median
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from marker.cloud.context import RecognitionFailure
+from marker.cloud.client import schema_prompt
+from marker.cloud.content import (
+    ContentResult, atom_id, bounds, context_box, latex_to_mathml,
+    math_required, resource_name, source_lines,
+)
+from marker.cloud.context import RecognitionFailure, fit_request
 from marker.cloud.regions import assess_text_quality, word_lines
 from marker.cloud.source import intersection
 from marker.processors.table_geometry import (
@@ -252,3 +260,471 @@ def group_tables(parts, client) -> list[LogicalTable]:
             table.grid = None
         table.parts.append(part)
     return tables
+
+
+@dataclass
+class TableResult(ContentResult):
+    grid: dict | None = None
+
+
+class TableSegment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["text", "math", "figure"]
+    atom_ids: list[str]
+    text: str = ""
+    latex: str = ""
+
+    @model_validator(mode="after")
+    def usable(self):
+        if self.kind == "math":
+            try:
+                latex_to_mathml(self.latex)
+            except RecognitionFailure:
+                raise ValueError("Required math is unresolved or unsupported") from None
+        return self
+
+
+class TableLine(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: str
+    parts: list[TableSegment]
+
+
+class TableCell(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: str
+    row: int = Field(ge=0)
+    column: int = Field(ge=0)
+    rowspan: int = Field(ge=1)
+    colspan: int = Field(ge=1)
+    lines: list[TableLine]
+
+
+def _table_schema(expected, trusted, row_count, column_count):
+    """Semantic checks run inside CloudClient's counted repair attempts."""
+    expected_by_id = {cell["id"]: cell for cell in expected}
+
+    class TableResponse(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        cells: list[TableCell]
+
+        @model_validator(mode="after")
+        def ownership_and_structure(self):
+            if len(self.cells) != len(expected_by_id) or {
+                cell.id for cell in self.cells
+            } != set(expected_by_id):
+                raise ValueError("Cell IDs must cover assigned cells once")
+            occupied = set()
+            for cell in self.cells:
+                original = expected_by_id[cell.id]
+                if trusted and any(
+                    getattr(cell, key) != original[key]
+                    for key in ("row", "column", "rowspan", "colspan")
+                ):
+                    raise ValueError("Trusted physical spans cannot change")
+                if (
+                    cell.row + cell.rowspan > row_count
+                    or cell.column + cell.colspan > column_count
+                ):
+                    raise ValueError("Cell span exceeds table extent")
+                slots = {
+                    (r, c)
+                    for r in range(cell.row, cell.row + cell.rowspan)
+                    for c in range(cell.column, cell.column + cell.colspan)
+                }
+                if occupied.intersection(slots):
+                    raise ValueError("Cell spans overlap")
+                occupied.update(slots)
+                expected_lines = {line["id"]: line for line in original["lines"]}
+                if len(cell.lines) != len(expected_lines) or {
+                    line.id for line in cell.lines
+                } != set(expected_lines):
+                    raise ValueError("Source baseline lines must be covered once")
+                for line in cell.lines:
+                    source_line = expected_lines[line.id]
+                    atoms = {atom["id"]: atom for atom in source_line["atoms"]}
+                    consumed = [
+                        identity for part in line.parts for identity in part.atom_ids
+                    ]
+                    if len(consumed) != len(atoms) or set(consumed) != set(atoms):
+                        raise ValueError("Line source atoms must be owned exactly once")
+                    if source_line["math_required"] and not any(
+                        part.kind == "math" for part in line.parts
+                    ):
+                        raise ValueError("Required complete expression must be math")
+                    for part in line.parts:
+                        if not part.atom_ids:
+                            raise ValueError("Output content has no source ownership")
+                        owned = [atoms[identity] for identity in part.atom_ids]
+                        if part.kind == "figure" and any(
+                            a["kind"] not in ("image", "vector", "unknown")
+                            for a in owned
+                        ):
+                            raise ValueError(
+                                "Selectable text cannot disappear into a figure"
+                            )
+                        if part.kind == "text":
+                            # Grid trust describes physical geometry. Raster
+                            # ordinary text can need OCR even in ruled cells.
+                            if not part.text.strip():
+                                raise ValueError("Required text remains unresolved")
+            return self
+
+    return TableResponse
+
+
+def _describe_cells(grid, positions):
+    described = []
+    originals = {}
+    for index, (row, column, rowspan, colspan, cell) in enumerate(
+        sorted(positions, key=lambda p: (p[0], p[1]))
+    ):
+        identity = f"c{index}"
+        originals[identity] = cell
+        lines = []
+        for number, atoms in enumerate(source_lines(cell["atoms"])):
+            box = bounds(atoms)
+            page = atoms[0].get("source_page", cell.get("source_page", grid["page"]))
+            lines.append(
+                {
+                    "id": f"{identity}l{number}",
+                    "page": page,
+                    "bbox": box,
+                    "layout_y": min(a.get("layout_bbox", a["bbox"])[1] for a in atoms),
+                    "math_required": math_required(atoms),
+                    "atoms": [
+                        {
+                            "id": atom_id(atom, page),
+                            "kind": atom.get("kind", "text"),
+                            "text": atom.get("text", ""),
+                            "bbox": atom.get("source_bbox", atom["bbox"]),
+                            "page": atom.get("source_page", page),
+                        }
+                        for atom in atoms
+                    ],
+                }
+            )
+        described.append(
+            {
+                "id": identity,
+                "row": row,
+                "column": column,
+                "rowspan": rowspan,
+                "colspan": colspan,
+                "lines": lines,
+            }
+        )
+    return described, originals
+
+
+def _window_prompt(cells, headers, trusted, rows, columns):
+    payload = {
+        "trusted": trusted,
+        "rows": rows,
+        "columns": columns,
+        "headers": headers,
+        "cells": cells,
+    }
+    return (
+        "Read these table source crops and geometry. Return ONLY owned cells and baseline lines in SOURCE. "
+        "headers and neighboring crop pixels are repeated context, never extra output. Each source atom ID "
+        "must occur exactly once on its assigned line. Preserve baseline IDs/order across all columns; "
+        "a merged cell may contain multiple expressions. Retain trusted spans exactly. If trusted=false, "
+        "reconstruct row/column spans within the table dimensions without overlap, retaining source cell/line IDs. "
+        "Use math with exact LaTeX for complete expressions, figure for diagrams, text for ordinary words. "
+        "Preserve phi/varphi, Cyrillic/Latin subscripts, decimal commas and superscripts. "
+        "Do not guess unreadable content.\nSOURCE:\n"
+        + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    )
+
+
+def _window_images(source, cells, originals, headers, maximum):
+    boxes = {}
+    for cell in cells:
+        if cell["lines"]:
+            for line in cell["lines"]:
+                boxes.setdefault(line["page"], []).append(line["bbox"])
+        else:
+            for page, box in originals[cell["id"]].get(
+                "source_boxes",
+                (
+                    (
+                        originals[cell["id"]].get("source_page", 0),
+                        originals[cell["id"]]["bbox"],
+                    ),
+                ),
+            ):
+                boxes.setdefault(page, []).append(box)
+    images = []
+    for page, source_boxes in sorted(boxes.items()):
+        box = bounds([{"bbox": b} for b in source_boxes])
+        images.append(source.crop(page, context_box(source, page, box)))
+    # A header image is repeated context only when the image budget permits.
+    if headers and len(images) < maximum and headers[0].get("page") is not None:
+        images.append(
+            source.crop(
+                headers[0]["page"],
+                context_box(source, headers[0]["page"], headers[0]["bbox"]),
+            )
+        )
+    return images
+
+
+def _table_windows(source, described, originals, client, trusted, rows, columns):
+    """Split owned source lines, never truncate cell content or response space."""
+    units = []
+    for cell in described:
+        if cell["lines"]:
+            units.extend((cell, line) for line in cell["lines"])
+        else:
+            units.append((cell, None))
+    units.sort(
+        key=lambda pair: (
+            pair[0]["row"],
+            pair[1]["layout_y"] if pair[1] else 0,
+            pair[0]["column"],
+        )
+    )
+    headers = [
+        {
+            "page": line["page"],
+            "bbox": line["bbox"],
+            "text": " ".join(
+                atom["text"] for atom in line["atoms"] if atom["kind"] == "text"
+            ),
+        }
+        for cell in described
+        if cell["row"] == 0
+        for line in cell["lines"]
+    ]
+    # Use one compact header descriptor, even for a wide multi-column header.
+    if headers:
+        first_page = headers[0]["page"]
+        same_page = [h for h in headers if h["page"] == first_page]
+        headers = [
+            {
+                "page": first_page,
+                "bbox": bounds([{"bbox": h["bbox"]} for h in same_page]),
+                "text": " | ".join(h["text"] for h in same_page)[:400],
+            }
+        ]
+    offset = 0
+    while offset < len(units):
+        selected = []
+        best = None
+        while offset + len(selected) < len(units):
+            candidate = selected + [units[offset + len(selected)]]
+            cells_by_id = {}
+            for cell, line in candidate:
+                entry = cells_by_id.setdefault(
+                    cell["id"],
+                    {
+                        key: cell[key]
+                        for key in ("id", "row", "column", "rowspan", "colspan")
+                    }
+                    | {"lines": []},
+                )
+                if line is not None:
+                    entry["lines"].append(line)
+            cells = list(cells_by_id.values())
+            # Conservative JSON response reservation: IDs, spans and segment
+            # fields cost more than source text alone. Math gets extra room.
+            output_estimate = 128 + sum(
+                120
+                + sum(
+                    120
+                    + sum(160 + len(a["text"].encode()) for a in line["atoms"])
+                    + (240 if line["math_required"] else 0)
+                    for line in cell["lines"]
+                )
+                for cell in cells
+            )
+            if output_estimate > client.cloud_max_output_tokens:
+                break
+            context_headers = headers if offset else []
+            prompt = _window_prompt(cells, context_headers, trusted, rows, columns)
+            schema = _table_schema(cells, trusted, rows, columns)
+            pages = {line["page"] for cell in cells for line in cell["lines"]}
+            if len(pages) > client.cloud_max_images:
+                break
+            images = _window_images(
+                source, cells, originals, context_headers, client.cloud_max_images
+            )
+            if len(images) > client.cloud_max_images:
+                break
+            try:
+                fit_request(
+                    schema_prompt(prompt, schema),
+                    images,
+                    client.cloud_context_tokens,
+                    client.cloud_max_output_tokens,
+                )
+            except RecognitionFailure:
+                break
+            selected = candidate
+            best = (cells, prompt, images, schema)
+        if best is None:
+            raise RecognitionFailure(
+                "A required table line cannot fit the bounded request"
+            )
+        yield best
+        offset += len(selected)
+
+
+def _validate_final_structure(recognized, rows, columns):
+    occupied = set()
+    for cell in recognized.values():
+        slots = {
+            (r, c)
+            for r in range(cell["row"], cell["row"] + cell["rowspan"])
+            for c in range(cell["column"], cell["column"] + cell["colspan"])
+        }
+        if (
+            not slots
+            or occupied.intersection(slots)
+            or any(r >= rows or c >= columns for r, c in slots)
+        ):
+            raise RecognitionFailure(
+                "Recognized table spans overlap or exceed table extent"
+            )
+        occupied.update(slots)
+    if occupied != {(r, c) for r in range(rows) for c in range(columns)}:
+        raise RecognitionFailure("Recognized table does not cover every row and column")
+
+
+def _render_recognized_table(source, described, originals, recognized, resources, grid):
+    html = ["<table><tbody>"]
+    source_by_id = {cell["id"]: cell for cell in described}
+    cells_by_row = {}
+    for cell in recognized.values():
+        cells_by_row.setdefault(cell["row"], []).append(cell)
+    for row in range(
+        max(cell["row"] + cell["rowspan"] for cell in recognized.values())
+    ):
+        html.append("<tr>")
+        for cell in sorted(cells_by_row.get(row, []), key=lambda c: c["column"]):
+            attrs = (f' rowspan="{cell["rowspan"]}"' if cell["rowspan"] > 1 else "") + (
+                f' colspan="{cell["colspan"]}"' if cell["colspan"] > 1 else ""
+            )
+            html.append(f"<td{attrs}>")
+            original = originals[cell["id"]]
+            expected_lines = {
+                line["id"]: line for line in source_by_id[cell["id"]]["lines"]
+            }
+            responses = {line["id"]: line for line in cell["lines"]}
+            cell_layout = original.get("layout_bbox", original["bbox"])
+            html.append(
+                f'<div style="position:relative;height:{cell_layout[3]-cell_layout[1]:.3f}pt">'
+            )
+            for identity, line in expected_lines.items():
+                result = responses[identity]
+                # Absolute source baseline placement preserves correspondence
+                # even when physical cells have no internal horizontal rules.
+                html.append(
+                    f'<div data-source-line="{identity}" data-source-page="{line["page"]}" '
+                    f'data-source-y="{line["bbox"][1]:.3f}" style="position:absolute;top:{line["layout_y"]-cell_layout[1]:.3f}pt;white-space:nowrap">'
+                )
+                atom_lookup = {
+                    atom_id(a, a.get("source_page", grid["page"])): a
+                    for a in original["atoms"]
+                }
+                for part in result["parts"]:
+                    atoms = [atom_lookup[identity] for identity in part["atom_ids"]]
+                    if part["kind"] == "math":
+                        box = bounds(atoms)
+                        page = atoms[0].get("source_page", line["page"])
+                        name = resource_name(
+                            "formula", page, box, tuple(part["atom_ids"])
+                        )
+                        resources[name] = source.crop(page, box)
+                        html.append(latex_to_mathml(part["latex"]))
+                    elif part["kind"] == "figure":
+                        box = bounds(atoms)
+                        page = atoms[0].get("source_page", line["page"])
+                        name = resource_name(
+                            "figure", page, box, tuple(part["atom_ids"])
+                        )
+                        resources[name] = source.resource(page, box)
+                        html.append(
+                            f'<img src="{name}" alt="Figure" style="width:{box[2]-box[0]:.3f}pt;height:{box[3]-box[1]:.3f}pt">'
+                        )
+                    else:
+                        # Trusted digital text retains its source spelling;
+                        # cloud is responsible for damaged/scanned text only.
+                        text = (
+                            " ".join(a.get("text", "") for a in atoms)
+                            if assess_text_quality(atoms, bounds(atoms)).trusted
+                            else part["text"]
+                        )
+                        html.append(escape(text))
+                    html.append(" ")
+                html.append("</div>")
+            html.append("</div></td>")
+        html.append("</tr>")
+    html.append("</tbody></table>")
+    return "".join(html)
+
+
+def recognize_table(source, logical_table, client):
+    """Recognize one logical table with bounded owned windows and one HTML grid.
+
+    Task 4 supplies scanned layout as grid cells/atoms in source coordinates,
+    trusted=False. No usable geometry returns an auditable incomplete result.
+    """
+    grid = deepcopy(logical_table.grid)
+    resources = {}
+    reasons = list(logical_table.warnings)
+    recognized = {}
+    try:
+        if not grid or not grid.get("cells") or grid_positions(grid) is None:
+            raise RecognitionFailure("Required table has no valid source cell layout")
+        xs, ys, positions = grid_positions(grid)
+        rows, columns = len(ys) - 1, len(xs) - 1
+        described, originals = _describe_cells(grid, positions)
+        trusted = grid.get("trusted", True)
+        for cells, prompt, images, schema in _table_windows(
+            source, described, originals, client, trusted, rows, columns
+        ):
+            try:
+                result = client.request(prompt, images, schema)
+            except RecognitionFailure:
+                for cell in cells:
+                    for line in cell["lines"]:
+                        name = resource_name(
+                            "unresolved-table", line["page"], line["bbox"], line["id"]
+                        )
+                        resources[name] = source.crop(line["page"], line["bbox"])
+                raise
+            for cell in result["cells"]:
+                if cell["id"] in recognized:
+                    previous = recognized[cell["id"]]
+                    if any(
+                        previous[key] != cell[key]
+                        for key in ("row", "column", "rowspan", "colspan")
+                    ):
+                        raise RecognitionFailure(
+                            "Split cell structure changed between windows"
+                        )
+                    previous["lines"].extend(cell["lines"])
+                else:
+                    recognized[cell["id"]] = cell
+        _validate_final_structure(recognized, rows, columns)
+        html = _render_recognized_table(
+            source, described, originals, recognized, resources, grid
+        )
+        return TableResult(
+            "table", html, html, resources, not reasons, tuple(reasons), grid=grid
+        )
+    except RecognitionFailure as error:
+        reasons.append(error.reason)
+        if not resources:
+            for part in logical_table.parts:
+                name = resource_name("unresolved-table", part.page, part.bbox)
+                resources[name] = source.crop(part.page, part.bbox)
+        html = "".join(
+            f'<p><img src="{name}" alt="Unresolved table source"></p>'
+            for name in resources
+        )
+        return TableResult(
+            "table", html, html, resources, False, tuple(reasons), grid=grid
+        )
