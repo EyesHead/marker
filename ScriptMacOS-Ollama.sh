@@ -52,7 +52,9 @@ pending=()
 for pdf in "${pdf_files[@]}"; do
     base="$(basename "$pdf")"
     name="${base%.*}"
-    if [ -f "$OUTPUT_DIR/$name/$name.md" ] && [ "${FORCE:-0}" != "1" ]; then
+    if [ -f "$OUTPUT_DIR/$name/$name.md" ] && [ "${FORCE:-0}" != "1" ] && \
+       ! grep -Eq '"status"[[:space:]]*:[[:space:]]*"(rejected|needs_review)"' \
+            "$OUTPUT_DIR/$name/${name}_tables.json" 2>/dev/null; then
         echo "Пропуск: $base уже сконвертирован (для пересборки: FORCE=1)."
     else
         pending+=("$pdf")
@@ -222,6 +224,7 @@ echo "LLM: облачный Ollama API, модель $OLLAMA_MODEL."
 echo "Пакет страниц: $PAGE_BATCH_SIZE; на каждый PDF один запуск Marker."
 
 failed=0
+quality_issues=0
 for pdf in "${pending[@]}"; do
     base="$(basename "$pdf")"
     name="${base%.*}"
@@ -265,6 +268,34 @@ for pdf in "${pending[@]}"; do
         continue
     fi
 
+    # A successful Marker exit alone does not mean table reconstruction passed.
+    table_status=0
+    "$MARKER_VENV/bin/python" - "$generated_dir/${name}_tables.json" <<'TABLECHECK' || table_status=$?
+import json
+import sys
+from collections import Counter
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as source:
+        archive = json.load(source)
+    reports = archive["validation"]
+    counts = Counter(report["status"] for report in reports)
+    accepted = len(archive["reconstruction"]["tables"])
+except (OSError, ValueError, KeyError, TypeError) as error:
+    print(f"Ошибка: отчёт таблиц недоступен ({type(error).__name__}).", file=sys.stderr)
+    sys.exit(1)
+print(f"Таблицы: принято {accepted}; проверка: {dict(counts)}.")
+if any(status != "structurally_valid" for status in counts):
+    print("Таблицы требуют проверки. Результат и исходные изображения будут сохранены.", file=sys.stderr)
+    sys.exit(2)
+TABLECHECK
+    if [ "$table_status" = "1" ]; then
+        failed=$((failed + 1))
+        continue
+    elif [ "$table_status" != "0" ]; then
+        quality_issues=$((quality_issues + 1))
+    fi
+
     # Публикуем результат только после успешной конвертации всего PDF.
     # Старые файлы при FORCE сохраняются, пока новый Markdown не готов.
     if ! mkdir -p "$note_dir"; then
@@ -290,12 +321,20 @@ for pdf in "${pending[@]}"; do
         failed=$((failed + 1))
         continue
     fi
-    echo "Готово: $note_dir/$name.md"
+    if [ "$table_status" = "0" ]; then
+        echo "Готово: $note_dir/$name.md"
+    else
+        echo "Сохранено для проверки: $note_dir/$name.md"
+    fi
 done
 
 echo "--------------------------------------------------"
 if [ "$failed" -gt 0 ]; then
     echo "Завершено с ошибками: $failed PDF. Успешные результаты сохранены." >&2
     exit 1
+fi
+if [ "$quality_issues" -gt 0 ]; then
+    echo "Результаты сохранены, но таблицы требуют проверки в $quality_issues PDF." >&2
+    exit 2
 fi
 echo "Все PDF обработаны."

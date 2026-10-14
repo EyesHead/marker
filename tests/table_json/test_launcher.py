@@ -6,6 +6,7 @@ import json
 import os
 import ssl
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -13,6 +14,27 @@ from urllib.error import HTTPError, URLError
 
 
 class LauncherTests(unittest.TestCase):
+    def run_table_check(self, validation):
+        script = (Path(__file__).parents[2] / "ScriptMacOS-Ollama.sh").read_text()
+        code = script.split("<<'TABLECHECK'", 1)[1].split("\n", 1)[1].split("\nTABLECHECK", 1)[0]
+        status = 0
+        with tempfile.TemporaryDirectory() as root:
+            archive = Path(root, "tables.json")
+            archive.write_text(json.dumps({"validation": validation, "reconstruction": {"tables": []}}))
+            with patch("sys.argv", ["table-check", str(archive)]), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    exec(compile(code, "launcher-table-check", "exec"), {})
+                except SystemExit as error:
+                    status = error.code
+        return status
+
+    def test_rejected_table_makes_conversion_require_review(self):
+        self.assertEqual(self.run_table_check([{"status": "rejected"}]), 2)
+
+    def test_valid_tables_complete_successfully(self):
+        self.assertEqual(self.run_table_check([{"status": "structurally_valid"}]), 0)
+
     def test_text_layer_mode_disables_local_ocr_and_keeps_cloud_tables(self):
         script = (Path(__file__).parents[2] / "ScriptMacOS-Ollama.sh").read_text()
         code = "args=(" + script.split("    args=(", 1)[1].split('    echo "--------------------------------------------------"', 1)[0]

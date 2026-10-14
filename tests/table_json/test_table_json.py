@@ -11,6 +11,7 @@ from PIL import Image
 from pydantic import BaseModel, ValidationError
 
 from marker.processors.llm.llm_table_json import LLMTableJSONProcessor
+from marker.processors.llm import BaseLLMProcessor
 from marker.output import save_output
 from marker.renderers.json import JSONRenderer
 from marker.renderers.markdown import MarkdownRenderer
@@ -173,6 +174,40 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(model.call_count, 3)
         self.assertIn("original", block.html)
         self.assertEqual(block.table_json_report["status"], "rejected")
+
+    def test_rejected_table_without_html_retains_a_source_image_in_markdown(self):
+        block = Table(polygon=PolygonBox.from_bbox([0, 0, 100, 100]), page_id=0, block_id=0)
+        block.table_geometry = geometry(str(block.id), 1)
+        page = PageGroup(polygon=PolygonBox.from_bbox([0, 0, 100, 100]), page_id=0,
+                         children=[block], structure=[block.id], highres_image=Image.new("RGB", (100, 100), "red"))
+        document = Document(filepath="scan.png", pages=[page])
+        LLMTableJSONProcessor(Mock(return_value={}),
+                              {"use_llm": True, "table_json_reconstruction": True})(document)
+        rendered = MarkdownRenderer({"table_json_reconstruction": True})(document)
+        self.assertIn("_source.png", rendered.markdown)
+        self.assertEqual(len(rendered.images), 1)
+        self.assertEqual(next(iter(rendered.images.values())).getpixel((0, 0)), (255, 0, 0))
+        self.assertIsNone(block.table_json)
+        self.assertEqual(block.table_json_report["status"], "rejected")
+        with tempfile.TemporaryDirectory() as output:
+            save_output(rendered, output, "document")
+            source_name = block.table_json_report["source_images"][0]["src"]
+            with Image.open(Path(output, source_name)) as saved:
+                self.assertEqual(saved.format, "PNG")
+        original_html = block.html
+        BaseLLMProcessor(None).handle_rewrites([{"id": str(block.id), "html": "lost table"}], document)
+        self.assertEqual(block.html, original_html)
+
+    def test_rejected_table_does_not_reference_an_image_when_extraction_disabled(self):
+        block = Table(polygon=PolygonBox.from_bbox([0, 0, 100, 100]), page_id=0, block_id=0)
+        block.table_geometry = geometry(str(block.id), 1)
+        page = PageGroup(polygon=PolygonBox.from_bbox([0, 0, 100, 100]), page_id=0,
+                         children=[block], structure=[block.id], highres_image=Image.new("RGB", (100, 100)))
+        document = Document(filepath="scan.png", pages=[page])
+        LLMTableJSONProcessor(Mock(return_value={}),
+                              {"use_llm": True, "table_json_reconstruction": True, "extract_images": False})(document)
+        self.assertNotIn("<img", block.html or "")
+        self.assertEqual(block.embedded_images, {})
 
     def test_processor_accepts_valid_json_and_protects_source_grid(self):
         block = Table(polygon=PolygonBox.from_bbox([0, 0, 100, 100]), page_id=0, block_id=0, html="old")

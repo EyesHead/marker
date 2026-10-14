@@ -46,6 +46,26 @@ class LLMTableJSONProcessor(BaseLLMProcessor):
                 run[0].table_json_report = {"status": "rejected", "errors": [type(error).__name__],
                                             "regions": [str(b.id) for b in run]}
                 run[0].update_metadata(llm_error_count=1)
+            if (run[0].table_json_report or {}).get("status") != "structurally_valid":
+                self.preserve_source_images(document, run)
+
+    def preserve_source_images(self, document, run):
+        """Keep a legible source when reconstruction fails, including diagrams.
+
+        The legacy text-layer table can be empty or omit formula glyphs. Its
+        HTML is kept when available, but cannot be the sole fallback.
+        """
+        if not self.extract_images:
+            return
+        source_images = []
+        for block in run:
+            name = f"{block.id.to_path()}_source.png"
+            block.embedded_images[name] = crop_table(document.get_page(block.page_id), block)[0]
+            block.html = (block.html or "") + (
+                '<p class="table-source">Таблица требует проверки; исходное изображение.</p>'
+                f'<p><img src="{name}" alt="Исходная таблица"></p>')
+            source_images.append({"region_id": str(block.id), "src": name})
+        run[0].table_json_report["source_images"] = source_images
 
     @staticmethod
     def candidate_continuation(document, previous, current):
