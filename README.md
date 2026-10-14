@@ -1,123 +1,170 @@
-# Marker: PDF → Markdown с HTML-таблицами
+# Marker: PDF → Markdown через Ollama Cloud
 
-Форк [EyesHead/marker](https://github.com/EyesHead/marker) для русскоязычных PDF, включая СП и ГОСТ. Текст сохраняется в Markdown, все таблицы — в HTML внутри Markdown. Для таблиц с векторными границами сетка строится по координатам PDF, а объединения задаются через `rowspan` и `colspan`. Текст и изображения помещаются в физические ячейки по своим координатам; строки без горизонтальных границ сохраняют исходное выравнивание по высоте.
+Форк [EyesHead/marker](https://github.com/EyesHead/marker) для русскоязычных PDF, включая СП и ГОСТ. Адаптивный конвертер использует текст, границы и изображения исходного PDF, а области с отсутствующим или повреждённым текстом распознаёт через **Ollama Cloud**, модель по умолчанию — **`gemma4:31b`**. Локальная Gemma и локальный VLM-сервер для этого пути не требуются.
 
-Формулы и греческие буквы, которые в PDF являются изображениями, сохраняются как PNG в исходных ячейках. Gemma добавляет LaTeX в `alt` этих изображений, сохраняя оригинальное отображение и сетку. Разорванные между страницами ячейки соединяются по открытым границам и совпадающим координатам; для остальных продолжений остаётся проверка LLM. Отдельный JSON таблиц не создаётся.
+Результат — Markdown с HTML-таблицами и LaTeX. Продолжения одной таблицы собираются из исходных страниц; физические ячейки сохраняют свои координаты, `rowspan` и `colspan`. Рисунки остаются ресурсами, а исходные изображения формул сохраняются для проверки распознавания. Отдельный JSON таблиц не создаётся.
 
-Основной вариант — **Ollama Cloud + Gemma 4 31B**. Gemma работает в облаке; Marker и, при необходимости, OCR работают на вашем компьютере. Результат удобно проверять в режиме чтения Obsidian. Отдельная JSON-реконструкция таблиц удалена.
+Общий запускатель — `ScriptOllama.py` (только стандартная библиотека Python). Обёртки передают ему параметры. Нужны **Python 3.10 или новее**, **Git**, интернет для установки и запросов к облаку и [API-ключ Ollama](https://ollama.com/settings/keys).
 
-Версия с таблицами по координатам находится в ветке **`codex/my-change`**. Скрипт по умолчанию устанавливает эту ветку. После её слияния в `master` можно явно задать `MARKER_REF=master` при обновлении.
+Версия адаптивного конвертера публикуется в ветке **`codex/my-change`**; запускатель устанавливает эту ветку по умолчанию. Переход на `master` выполняется явно после слияния.
 
-## Запуск на macOS: все PDF из папки
+## Папки и результаты
 
-Нужны Python 3.10 или новее, Git, интернет и [API-ключ Ollama](https://ollama.com/settings/keys).
-
-Папки остаются прежними:
+Разместите **Python-файл и обёртки вместе**. На macOS нужны все три файла, показанные ниже; на Ubuntu — `ScriptOllama.py` и `ScriptOllama.sh`, на Windows — `ScriptOllama.py` и `ScriptOllama.cmd` (или `ScriptOllama.ps1`).
 
 ```text
 PolytechBrain/
+  ScriptOllama.py
+  ScriptOllama.sh
   ScriptMacOS-Ollama.sh
   PDF/
     document.pdf
   Output/
     document/
       document.md
+      document_meta.json
       ...изображения...
 ```
 
-Получите обновлённый скрипт:
+`PDF` и `Output` создаются рядом с `ScriptOllama.py`, независимо от текущей папки терминала. Пути с пробелами и кириллицей поддерживаются. Обрабатываются файлы `.pdf`/`.PDF` непосредственно в `PDF`; исходные файлы не изменяются. `--directory "/другая папка"` задаёт другую папку с `PDF` и `Output`.
+
+`document_meta.json` содержит служебную сводку `cloud_conversion`: `status`, `reasons`, `requests`. При неполном распознавании Markdown и ресурсы сохраняются для просмотра, выводятся причины, а запуск завершается с кодом `1`. Такой PDF повторно обрабатывается при следующем запуске. Полностью готовые результаты пропускаются. Результаты без корректной сводки и прежние результаты с `document_tables.json` пересобираются; старый JSON таблиц удаляется после публикации нового результата.
+
+## macOS
+
+Установите Python 3.10+ и Git, затем загрузите **три** файла в папку хранилища:
 
 ```bash
+mkdir -p "$HOME/BRAIN_University/PolytechBrain"
 cd "$HOME/BRAIN_University/PolytechBrain"
+python3 --version
+git --version
+curl -fL https://raw.githubusercontent.com/EyesHead/marker/refs/heads/codex/my-change/ScriptOllama.py -o ScriptOllama.py
+curl -fL https://raw.githubusercontent.com/EyesHead/marker/refs/heads/codex/my-change/ScriptOllama.sh -o ScriptOllama.sh
 curl -fL https://raw.githubusercontent.com/EyesHead/marker/refs/heads/codex/my-change/ScriptMacOS-Ollama.sh -o ScriptMacOS-Ollama.sh
-chmod +x ScriptMacOS-Ollama.sh
+chmod +x ScriptOllama.sh ScriptMacOS-Ollama.sh
+mkdir -p PDF
 ```
 
-Для PDF с читаемым текстовым слоем, в том числе на Mac M1 с ограниченной памятью:
-
-```bash
-DISABLE_OCR=1 ./ScriptMacOS-Ollama.sh
-```
-
-В начале появится окно для ключа Ollama. Ключ используется только на время запуска и не сохраняется в файл. Если `OLLAMA_API_KEY` уже задан в окружении, окно пропускается.
-
-Скрипт один раз скачивает форк и устанавливает зависимости в `~/.cache/eyeshead-marker`. При обнаружении прежнего JSON-конвейера или HTML-версии без сборки по координатам он однократно обновляет установленный код. Последующие запуски используют кэш; автоматического обновления при каждом запуске нет.
-
-Готовые Markdown пропускаются. Результаты прежнего JSON-конвейера, рядом с которыми есть `document_tables.json`, автоматически пересобираются в HTML. Старый отчёт удаляется после успешного сохранения нового Markdown.
-
-## Повторная конвертация и явное обновление
-
-Пересобрать все PDF, включая уже готовые:
-
-```bash
-FORCE=1 DISABLE_OCR=1 ./ScriptMacOS-Ollama.sh
-```
-
-Обновить установленный Marker из выбранной ветки и пересобрать PDF:
-
-```bash
-UPDATE_MARKER=1 FORCE=1 DISABLE_OCR=1 ./ScriptMacOS-Ollama.sh
-```
-
-После слияния HTML-версии в `master`:
-
-```bash
-MARKER_REF=master UPDATE_MARKER=1 FORCE=1 DISABLE_OCR=1 ./ScriptMacOS-Ollama.sh
-```
-
-## Сканы и повреждённый текстовый слой
-
-Для автоматического определения страниц, которым нужен OCR:
+Положите PDF в `PDF` и запустите:
 
 ```bash
 ./ScriptMacOS-Ollama.sh
 ```
 
-Для принудительного OCR всех страниц:
+Существующее имя `ScriptMacOS-Ollama.sh` сохранено. На Mac появится системное окно со скрытым вводом ключа. При недоступном окне используется защищённый ввод в терминале. Отмена прекращает запуск до установки и конвертации.
+
+## Ubuntu 25
+
+Установите необходимые средства и загрузите **два** файла:
 
 ```bash
-FORCE=1 FORCE_OCR=1 ./ScriptMacOS-Ollama.sh
+sudo apt update
+sudo apt install -y python3 python3-venv python3-dev git curl build-essential
+mkdir -p "$HOME/PolytechBrain"
+cd "$HOME/PolytechBrain"
+curl -fL https://raw.githubusercontent.com/EyesHead/marker/refs/heads/codex/my-change/ScriptOllama.py -o ScriptOllama.py
+curl -fL https://raw.githubusercontent.com/EyesHead/marker/refs/heads/codex/my-change/ScriptOllama.sh -o ScriptOllama.sh
+chmod +x ScriptOllama.sh
+mkdir -p PDF
+./ScriptOllama.sh
 ```
 
-OCR использует локальные модели Marker и требует памяти. `DISABLE_OCR=1` подходит только для читаемого текстового слоя; его нельзя совмещать с `FORCE_OCR=1`.
+Положите PDF в созданную папку `PDF` и повторите последнюю команду. Ключ вводится скрыто в терминале. При запуске без терминала используется скрытый GUI-ввод, если доступен Tk; при отсутствии обоих способов запуск сообщает об этом и возвращает код `1`.
 
-## Один PDF через CLI и Ollama Cloud
+## Windows 10/11
 
-Однократная установка:
+Установите Python 3.10+ с Python Launcher (`py`) или Python в `PATH`, а также Git. Откройте PowerShell и загрузите **два** файла:
+
+```powershell
+New-Item -ItemType Directory -Force "$env:USERPROFILE\PolytechBrain" | Out-Null
+Set-Location "$env:USERPROFILE\PolytechBrain"
+py -3 --version
+git --version
+Invoke-WebRequest 'https://raw.githubusercontent.com/EyesHead/marker/refs/heads/codex/my-change/ScriptOllama.py' -OutFile ScriptOllama.py
+Invoke-WebRequest 'https://raw.githubusercontent.com/EyesHead/marker/refs/heads/codex/my-change/ScriptOllama.cmd' -OutFile ScriptOllama.cmd
+New-Item -ItemType Directory -Force PDF | Out-Null
+.\ScriptOllama.cmd
+```
+
+Положите PDF в `PDF` и повторите `.\ScriptOllama.cmd`. Ключ вводится скрыто в терминале; без терминала используется окно Tk, если оно доступно. Обёртка выбирает `py -3`, затем `python`. Изолированное окружение использует `venv\Scripts\python.exe`.
+
+Для PowerShell есть отдельная обёртка:
+
+```powershell
+Invoke-WebRequest 'https://raw.githubusercontent.com/EyesHead/marker/refs/heads/codex/my-change/ScriptOllama.ps1' -OutFile ScriptOllama.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ScriptOllama.ps1 --disable-ocr
+```
+
+Можно запускать общий файл напрямую: `py -3 .\ScriptOllama.py --help`.
+
+## Установка, кэш и обновление
+
+При первой конвертации запускатель клонирует репозиторий в `source`, создаёт отдельный `venv` и выполняет `python -m pip install --editable source`. Успешная установленная ревизия записывается в `installed-revision`. Неудачная установка повторяется при следующем запуске. Обычные повторные конвертации используют установленный код без запросов к GitHub; для распознавания через Ollama интернет по-прежнему нужен.
+
+| ОС | Кэш по умолчанию |
+| --- | --- |
+| macOS | `~/Library/Caches/eyeshead-marker`; существующий `~/.cache/eyeshead-marker` используется на прежнем месте |
+| Ubuntu | `$XDG_CACHE_HOME/eyeshead-marker` или `~/.cache/eyeshead-marker` |
+| Windows | `%LOCALAPPDATA%\eyeshead-marker` |
+
+`MARKER_CACHE` или `--cache-dir` задаёт другой путь. Кэш прежнего конвертера однократно обновляется до выбранной ветки, если в нём отсутствует адаптивный конвертер или остался JSON-конвейер. Изменённый вручную кэш автоматически не перезаписывается: запуск сообщает его путь.
+
+Принудительная пересборка и явное обновление на macOS/Ubuntu:
 
 ```bash
-git clone --branch codex/my-change https://github.com/EyesHead/marker.git
-cd marker
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --editable .
+FORCE=1 DISABLE_OCR=1 ./ScriptOllama.sh
+UPDATE_MARKER=1 FORCE=1 ./ScriptOllama.sh
+MARKER_REF=master UPDATE_MARKER=1 FORCE=1 ./ScriptOllama.sh
 ```
 
-Введите ключ скрыто. `OPENAI_API_KEY` здесь содержит ключ **Ollama** для совместимого API:
+Последняя команда применяется после слияния адаптивной версии в `master`. На Windows те же действия задаются параметрами:
+
+```powershell
+.\ScriptOllama.cmd --force --disable-ocr
+.\ScriptOllama.cmd --update-marker --force
+.\ScriptOllama.cmd --ref master --update-marker --force
+```
+
+Обновление кэша Marker не обновляет скачанные файлы запускателя: для этого повторите команды загрузки из раздела вашей ОС.
+
+## Параметры распознавания
+
+`DISABLE_OCR=1` / `--disable-ocr` отключает общее OCR текста; распознавание обязательных формул сохраняется. Если необходимый текст недоступен, результат будет неполным. Для сканов используйте обычный запуск; `FORCE_OCR=1` / `--force-ocr` принудительно включает распознавание текста. `FORCE_OCR` и `DISABLE_OCR` несовместимы.
+
+| Параметр | Переменная окружения | По умолчанию |
+| --- | --- | --- |
+| `--model` | `OLLAMA_MODEL` | `gemma4:31b` |
+| `--base-url` | `OLLAMA_BASE_URL` | `https://ollama.com/v1` |
+| `--context-tokens` | `CLOUD_CONTEXT_TOKENS` | `8192` |
+| `--max-output-tokens` | `CLOUD_MAX_OUTPUT_TOKENS` | `2048` |
+| `--max-images` | `CLOUD_MAX_IMAGES` | `3` |
+| `--crop-dpi` | `CLOUD_CROP_DPI` | `600` |
+| `--max-attempts` | `CLOUD_MAX_ATTEMPTS` | `3` (исходный запрос и до двух повторов) |
+| `--max-requests` | `CLOUD_MAX_REQUESTS` | `0` (без общего лимита на PDF) |
+| `--page-batch-size` | `PAGE_BATCH_SIZE` | `30` (совместимая настройка обработки) |
+| `--force` | `FORCE=1` | выключено |
+| `--update-marker` | `UPDATE_MARKER=1` | выключено |
+| `--ref` | `MARKER_REF` | `codex/my-change` |
+| `--repo` | `MARKER_REPO` | `https://github.com/EyesHead/marker.git` |
+
+Бюджеты токенов — консервативные клиентские ограничения, а не точный токенизатор или настройка контекста сервера. Они включают резерв ответа. Для запроса копия изображения ограничивается длинной стороной 1536 пикселей и может уменьшаться дополнительно; сохраняемый ресурс сохраняет полное разрешение. Векторные кропы создаются при заданном DPI, растры сохраняют исходные пиксели. Все этапы используют общий счётчик запросов; повторные попытки входят в `--max-requests`.
+
+Пример запуска с пределом десять облачных запросов на PDF:
 
 ```bash
-export OPENAI_API_KEY="$(python -c 'import getpass; print(getpass.getpass("Ollama API key: "))')"
+./ScriptOllama.sh --max-requests 10 --context-tokens 8192 --max-output-tokens 2048
 ```
 
-Запуск для PDF с текстовым слоем:
+Ключ передаётся конвертеру только через `OLLAMA_API_KEY` в окружении дочернего процесса. Значение из этой переменной заменяет диалог. Запускатель не принимает ключ в аргументах, не сохраняет его в настройках и скрывает его при выводе сообщений дочернего процесса.
+
+## Автоматические проверки
+
+Офлайн-проверки не вызывают Ollama и не скачивают модели:
 
 ```bash
-marker_single document.pdf \
-  --output_dir Output \
-  --output_format markdown \
-  --use_llm \
-  --llm_service marker.services.openai.OpenAIService \
-  --openai_base_url https://ollama.com/v1 \
-  --openai_model gemma4:31b \
-  --openai_image_format png \
-  --disable_ocr \
-  --redo_inline_math \
-  --max_concurrency 1 \
-  --max_output_tokens 32768 \
-  --timeout 180
-unset OPENAI_API_KEY
+python -m unittest discover -s tests/cloud -v
+python -m unittest discover -s tests/html_tables -v
 ```
 
-Для скана уберите `--disable_ocr`. В прямом облачном API используется имя `gemma4:31b`.
-
-Результат: `Output/document/document.md` и изображения рядом. Ширина геометрических таблиц сохраняется в единицах PDF: широкие таблицы могут потребовать горизонтальной прокрутки. Для сканов и таблиц без надёжных векторных границ используются прежние методы распознавания; точность для них нужно проверять отдельно. LaTeX, добавленный Gemma к изображениям, также требует проверки.
+Проверки пути Windows на другой ОС не заменяют реальный запуск. macOS проверяется локально; подтверждение Windows 10/11 и Ubuntu 25 требует успешных соответствующих CI-заданий. Ручной запрос к Ollama выполняется отдельно после интеграции, со скрытым вводом ключа и лимитом десять реальных запросов.
