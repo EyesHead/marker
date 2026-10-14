@@ -72,14 +72,15 @@
 
 ### Task 3: Visible LaTeX and table content within context
 
-**Files:** `marker/cloud/content.py`, `marker/cloud/tables.py`, `marker/processors/table_geometry.py`, `marker/renderers/markdown.py`, `tests/cloud/test_content.py`.
+**Files:** `marker/cloud/content.py`, `marker/cloud/tables.py`, `marker/processors/table_geometry.py`, `marker/renderers/markdown.py`, `marker/output.py`, `pyproject.toml`, `uv.lock`, `tests/cloud/test_content.py`.
 
 **Interfaces:** `recognize_region(source, region, client) -> recognized text/math/figure result`; `recognize_table(source, logical_table, client) -> HTML/resources/status`. Requests use whole-expression crops with nearby context and table windows with repeated headers.
 
 - [ ] Add failures for a whole inequality assembled from multiple glyphs; text-layer formulas; math outside tables; a diagram in a cell; an oversized table split across windows; invalid cell spans and unresolved math.
 - [ ] Run tests and confirm failures.
-- [ ] Classify and recognise complete expressions rather than isolated glyphs. Produce real math content with retained audit PNGs. Preserve figures as resource links. Build/validate HTML and stitch bounded windows into one table.
-- [ ] Verify inline/block math rendering in table HTML and visual examples; commit.
+- [ ] Classify and recognise complete expressions rather than isolated glyphs. Produce real math content with retained audit PNGs. Preserve figures as resource links and retain PNG alpha. Build/validate HTML and stitch bounded windows into one table.
+- [ ] Render table math as native MathML with exact LaTeX inside `semantics/annotation encoding="application/x-tex"`; the user confirmed this after actual Obsidian tests. Outside tables retain Markdown LaTeX delimiters. Add the pure-Python latex2mathml runtime dependency and preserve native MathML in MarkdownRenderer.
+- [ ] Verify inline/block math rendering, phi/varphi distinction, intact LaTeX annotations, PNG alpha and visual examples; commit.
 
 ### Task 4: Adaptive converter, scans and honest completion
 
