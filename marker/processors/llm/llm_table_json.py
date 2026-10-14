@@ -9,6 +9,7 @@ from pydantic import ValidationError
 from marker.logger import get_logger
 from marker.processors.llm import BaseLLMProcessor
 from marker.schema import BlockTypes
+from marker.services import InvalidLLMResponse
 from marker.tables.geometry import CAPTION, crop_table
 from marker.tables.render import render_table
 from marker.tables.schema import TableReconstruction
@@ -72,14 +73,18 @@ class LLMTableJSONProcessor(BaseLLMProcessor):
         errors, warnings, response = [], [], None
         for _ in range(max(0, self.table_json_retries) + 1):
             response = self.llm_service(prompt, images, block, TableReconstruction)
-            try:
-                result = TableReconstruction.model_validate(response)
-                errors, warnings = validate_reconstruction(result, geometry)
-                if not errors:
-                    return result, [], warnings, response
-            except ValidationError as error:
-                errors = [f'{e["loc"]}: {e["msg"]}' for e in error.errors(include_input=False)]
+            if isinstance(response, InvalidLLMResponse):
+                errors, response = response.errors, response.response
+            else:
+                try:
+                    result = TableReconstruction.model_validate(response)
+                    errors, warnings = validate_reconstruction(result, geometry)
+                    if not errors:
+                        return result, [], warnings, response
+                except ValidationError as error:
+                    errors = [f'{e["loc"]}: {e["msg"]}' for e in error.errors(include_input=False)]
             prompt = (TABLE_PROMPT + "\n\nINPUT JSON:\n" + json.dumps(payload, ensure_ascii=False)
+                      + "\n\nПредыдущий ответ (не прошёл проверку):\n" + json.dumps(response, ensure_ascii=False)
                       + "\n\nПредыдущий ответ отклонён. Исправь перечисленные нарушения, сохрани все исходные данные:\n"
                       + json.dumps(errors[:30], ensure_ascii=False))
         return None, errors, warnings, response

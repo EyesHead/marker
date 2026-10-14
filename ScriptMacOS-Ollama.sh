@@ -11,7 +11,7 @@ set -o pipefail
 
 # Настройки
 MARKER_REPO="https://github.com/EyesHead/marker.git"
-MARKER_REF="codex/my-change"
+MARKER_REF="master"
 MARKER_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/eyeshead-marker"
 MARKER_ROOT="$MARKER_CACHE/source"
 MARKER_VENV="$MARKER_CACHE/venv"
@@ -21,10 +21,16 @@ PAGE_BATCH_SIZE=30
 REDO_INLINE_MATH=1
 MODE=""                         # "", "fast" или "balanced"
 FORCE_OCR="${FORCE_OCR:-0}"     # 1 — распознавать заново все страницы
+DISABLE_OCR="${DISABLE_OCR:-0}" # 1 — использовать текстовый слой, без локального Surya VLM
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PDF_DIR="$SCRIPT_DIR/PDF"
 OUTPUT_DIR="$SCRIPT_DIR/Output"
+
+if [ "$FORCE_OCR" = "1" ] && [ "$DISABLE_OCR" = "1" ]; then
+    echo "Ошибка: FORCE_OCR=1 и DISABLE_OCR=1 несовместимы." >&2
+    exit 1
+fi
 
 if ! command -v git >/dev/null 2>&1; then
     echo "Ошибка: для первой установки Marker требуется git." >&2
@@ -85,22 +91,55 @@ if [ -z "$api_key" ]; then
     exit 1
 fi
 
-if ! OPENAI_API_KEY="$api_key" python3 - "$OLLAMA_BASE_URL/models/$OLLAMA_MODEL" <<'PY'
+PREFLIGHT_PYTHON="$(command -v python3)"
+if [ -x "$MARKER_VENV/bin/python" ]; then
+    PREFLIGHT_PYTHON="$MARKER_VENV/bin/python"
+fi
+if ! OPENAI_API_KEY="$api_key" "$PREFLIGHT_PYTHON" - "$OLLAMA_BASE_URL" "$OLLAMA_MODEL" <<'PY'
+import json
 import os
+import ssl
 import sys
+import time
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-request = Request(sys.argv[1], headers={"Authorization": "Bearer " + os.environ["OPENAI_API_KEY"]})
+# Python from python.org may have no macOS CA bundle until its certificates
+# installer is run. Use the same public CA roots as the OpenAI HTTP client.
 try:
-    with urlopen(request, timeout=30):
-        pass
-except HTTPError as error:
-    print(f"Ошибка Ollama API: HTTP {error.code}. Проверьте ключ и доступ к модели.", file=sys.stderr)
-    sys.exit(1)
-except URLError:
-    print("Ошибка: не удалось подключиться к облачному Ollama API.", file=sys.stderr)
-    sys.exit(1)
+    import certifi
+except ImportError:
+    try:
+        from pip._vendor import certifi
+    except ImportError:
+        print("Ошибка: не найден набор CA-сертификатов certifi. Установите certifi для Python.", file=sys.stderr)
+        sys.exit(1)
+ssl_context = ssl.create_default_context()
+ssl_context.load_verify_locations(cafile=certifi.where())
+api_key = os.environ["OPENAI_API_KEY"]
+payload = {"model": sys.argv[2], "messages": [{"role": "user", "content": "Reply OK."}],
+           "max_tokens": 1, "temperature": 0}
+request = Request(sys.argv[1].rstrip("/") + "/chat/completions",
+                  data=json.dumps(payload).encode("utf-8"),
+                  headers={"Authorization": "Bearer " + api_key, "Content-Type": "application/json"})
+for attempt in range(1, 4):
+    try:
+        with urlopen(request, timeout=30, context=ssl_context) as response:
+            result = json.load(response)
+        if not result.get("choices"):
+            raise ValueError("Ollama returned no model response")
+        print("Ollama API: доступ к модели подтверждён.")
+        break
+    except HTTPError as error:
+        print(f"Ошибка Ollama API: HTTP {error.code}. Проверьте ключ и доступ к модели.", file=sys.stderr)
+        sys.exit(1)
+    except (URLError, TimeoutError, OSError, ValueError) as error:
+        reason = error.reason if isinstance(error, URLError) else error
+        detail = str(reason).replace(api_key, "[ключ скрыт]")
+        print(f"Подключение к Ollama, попытка {attempt}/3: {type(reason).__name__}: {detail}", file=sys.stderr)
+        if attempt == 3:
+            sys.exit(1)
+        time.sleep(2 * attempt)
 PY
 then
     exit 1
@@ -208,6 +247,7 @@ for pdf in "${pending[@]}"; do
     if [ "$REDO_INLINE_MATH" = "1" ]; then args+=(--redo_inline_math); fi
     if [ -n "$MODE" ]; then args+=(--mode "$MODE"); fi
     if [ "$FORCE_OCR" = "1" ]; then args+=(--force_ocr); fi
+    if [ "$DISABLE_OCR" = "1" ]; then args+=(--disable_ocr); fi
 
     echo "--------------------------------------------------"
     echo "Конвертирую: $base"

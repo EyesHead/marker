@@ -1,6 +1,6 @@
 # Marker: PDF → Markdown и таблицы в JSON
 
-Форк [EyesHead/marker](https://github.com/EyesHead/marker/tree/codex/my-change) для конвертации русскоязычных PDF, включая СП и ГОСТ. Текст сохраняется в Markdown, таблицы — в HTML внутри Markdown и отдельном JSON с координатами, объединёнными ячейками, формулами и изображениями.
+Форк [EyesHead/marker](https://github.com/EyesHead/marker) для конвертации русскоязычных PDF, включая СП и ГОСТ. Текст сохраняется в Markdown, таблицы — в HTML внутри Markdown и отдельном JSON с координатами, объединёнными ячейками, формулами и изображениями.
 
 Основной вариант — **Ollama Cloud + Gemma 4 31B**. Gemma работает в облаке; Marker и OCR работают на вашем компьютере. Установка локальной Gemma не требуется.
 
@@ -10,7 +10,7 @@
 - Аккаунт Ollama и [API-ключ](https://ollama.com/settings/keys). Доступ к модели зависит от лимитов аккаунта.
 - PDF в папке `PDF` рядом со скриптом.
 
-Рабочая ветка с этими доработками: `codex/my-change`.
+Стабильная ветка с этими доработками: `master`.
 
 ## 1. Основной запуск на macOS: все PDF из папки
 
@@ -28,7 +28,7 @@ PolytechBrain/
 
 ```bash
 cd "$HOME/BRAIN_University/PolytechBrain"
-curl -fL https://raw.githubusercontent.com/EyesHead/marker/refs/heads/codex/my-change/ScriptMacOS-Ollama.sh -o ScriptMacOS-Ollama.sh
+curl -fL https://raw.githubusercontent.com/EyesHead/marker/refs/heads/master/ScriptMacOS-Ollama.sh -o ScriptMacOS-Ollama.sh
 chmod +x ScriptMacOS-Ollama.sh
 ```
 
@@ -56,7 +56,7 @@ FORCE=1 ./ScriptMacOS-Ollama.sh
 Один раз установите эту ветку в отдельное Python-окружение:
 
 ```bash
-git clone --branch codex/my-change https://github.com/EyesHead/marker.git
+git clone --branch master https://github.com/EyesHead/marker.git
 cd marker
 python3 -m venv .venv
 source .venv/bin/activate
@@ -88,6 +88,19 @@ marker_single "$HOME/BRAIN_University/PolytechBrain/PDF/document.pdf" \
 ```
 
 Для прямого облачного API используется имя `gemma4:31b`; суффикс `-cloud` не требуется. [Документация Ollama](https://docs.ollama.com/api/openai-compatibility).
+
+### PDF с текстовым слоем на Mac с ограниченной памятью
+
+Чтобы читать существующий текстовый слой без локального Surya VLM:
+
+```bash
+DISABLE_OCR=1 ./ScriptMacOS-Ollama.sh
+```
+
+В CLI добавьте `--disable_ocr`. Таблицы и исправление формул через Gemma
+продолжают работать в облаке. Этот режим подходит только для PDF с читаемым
+текстовым слоем: сканированные страницы он не распознаёт. Не совмещайте его
+с `FORCE_OCR=1`.
 
 ## 4. Сканы или PDF с повреждённым текстовым слоем
 

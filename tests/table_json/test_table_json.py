@@ -19,6 +19,7 @@ from marker.schema.document import Document
 from marker.schema.groups.page import PageGroup
 from marker.schema.polygon import PolygonBox
 from marker.services.openai import OpenAIService
+from marker.services import InvalidLLMResponse
 from marker.tables.render import render_table
 from marker.tables.geometry import CAPTION
 from marker.tables.schema import TableReconstruction
@@ -126,6 +127,20 @@ class ValidationTests(unittest.TestCase):
 
 
 class WindowTests(unittest.TestCase):
+    def test_schema_errors_and_candidate_reach_the_repair_prompt(self):
+        g = geometry("a", 1)
+        invalid = reconstruction([g]).model_dump()
+        invalid["tables"][0]["cells"][0]["role"] = "empty"
+        service = Mock(side_effect=[InvalidLLMResponse(invalid, ["tables.0.cells.0.role: invalid role empty"]),
+                                    reconstruction([g]).model_dump()])
+        processor = LLMTableJSONProcessor(service, {"use_llm": True, "table_json_reconstruction": True})
+        result, errors, _, _ = processor.reconstruct_window([g], [], None, [])
+        self.assertIsNotNone(result)
+        self.assertEqual(errors, [])
+        prompt = service.call_args.args[0]
+        self.assertIn("tables.0.cells.0.role", prompt)
+        self.assertIn('"role": "empty"', prompt)
+
     def test_table_number_suffix_is_preserved(self):
         self.assertEqual(CAPTION.match("Таблица 10а")[1], "10а")
         self.assertNotEqual(CAPTION.match("Таблица 10")[1], CAPTION.match("Таблица 10а")[1])
@@ -223,6 +238,20 @@ class ExportTests(unittest.TestCase):
 
 
 class CloudServiceTests(unittest.TestCase):
+    def test_invalid_cloud_json_is_falsey_and_preserved_for_repair(self):
+        value = reconstruction([geometry("a", 1)]).model_dump()
+        value["tables"][0]["cells"][0]["role"] = "empty"
+        service = OpenAIService({"openai_api_key": "offline-placeholder", "openai_base_url": "https://ollama.com/v1"})
+        client = Mock()
+        client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(value)), finish_reason="stop")], usage=None)
+        service.get_client = Mock(return_value=client)
+        response = service("reconstruct", None, None, TableReconstruction)
+        self.assertIsInstance(response, InvalidLLMResponse)
+        self.assertFalse(response)
+        self.assertEqual(response.response, value)
+        self.assertTrue(any("role" in e for e in response.errors))
+
     def test_cloud_omits_unsupported_response_format_and_validates_json_locally(self):
         class Reply(BaseModel):
             value: str
