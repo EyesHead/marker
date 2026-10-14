@@ -11,6 +11,7 @@ from PIL import Image
 from pydantic import BaseModel, ValidationError
 
 from marker.processors.llm.llm_table_json import LLMTableJSONProcessor
+from marker.processors.llm import BaseLLMProcessor
 from marker.output import save_output
 from marker.renderers.json import JSONRenderer
 from marker.renderers.markdown import MarkdownRenderer
@@ -19,6 +20,7 @@ from marker.schema.document import Document
 from marker.schema.groups.page import PageGroup
 from marker.schema.polygon import PolygonBox
 from marker.services.openai import OpenAIService
+from marker.services import InvalidLLMResponse
 from marker.tables.render import render_table
 from marker.tables.geometry import CAPTION
 from marker.tables.schema import TableReconstruction
@@ -126,6 +128,20 @@ class ValidationTests(unittest.TestCase):
 
 
 class WindowTests(unittest.TestCase):
+    def test_schema_errors_and_candidate_reach_the_repair_prompt(self):
+        g = geometry("a", 1)
+        invalid = reconstruction([g]).model_dump()
+        invalid["tables"][0]["cells"][0]["role"] = "empty"
+        service = Mock(side_effect=[InvalidLLMResponse(invalid, ["tables.0.cells.0.role: invalid role empty"]),
+                                    reconstruction([g]).model_dump()])
+        processor = LLMTableJSONProcessor(service, {"use_llm": True, "table_json_reconstruction": True})
+        result, errors, _, _ = processor.reconstruct_window([g], [], None, [])
+        self.assertIsNotNone(result)
+        self.assertEqual(errors, [])
+        prompt = service.call_args.args[0]
+        self.assertIn("tables.0.cells.0.role", prompt)
+        self.assertIn('"role": "empty"', prompt)
+
     def test_table_number_suffix_is_preserved(self):
         self.assertEqual(CAPTION.match("Таблица 10а")[1], "10а")
         self.assertNotEqual(CAPTION.match("Таблица 10")[1], CAPTION.match("Таблица 10а")[1])
@@ -158,6 +174,40 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(model.call_count, 3)
         self.assertIn("original", block.html)
         self.assertEqual(block.table_json_report["status"], "rejected")
+
+    def test_rejected_table_without_html_retains_a_source_image_in_markdown(self):
+        block = Table(polygon=PolygonBox.from_bbox([0, 0, 100, 100]), page_id=0, block_id=0)
+        block.table_geometry = geometry(str(block.id), 1)
+        page = PageGroup(polygon=PolygonBox.from_bbox([0, 0, 100, 100]), page_id=0,
+                         children=[block], structure=[block.id], highres_image=Image.new("RGB", (100, 100), "red"))
+        document = Document(filepath="scan.png", pages=[page])
+        LLMTableJSONProcessor(Mock(return_value={}),
+                              {"use_llm": True, "table_json_reconstruction": True})(document)
+        rendered = MarkdownRenderer({"table_json_reconstruction": True})(document)
+        self.assertIn("_source.png", rendered.markdown)
+        self.assertEqual(len(rendered.images), 1)
+        self.assertEqual(next(iter(rendered.images.values())).getpixel((0, 0)), (255, 0, 0))
+        self.assertIsNone(block.table_json)
+        self.assertEqual(block.table_json_report["status"], "rejected")
+        with tempfile.TemporaryDirectory() as output:
+            save_output(rendered, output, "document")
+            source_name = block.table_json_report["source_images"][0]["src"]
+            with Image.open(Path(output, source_name)) as saved:
+                self.assertEqual(saved.format, "PNG")
+        original_html = block.html
+        BaseLLMProcessor(None).handle_rewrites([{"id": str(block.id), "html": "lost table"}], document)
+        self.assertEqual(block.html, original_html)
+
+    def test_rejected_table_does_not_reference_an_image_when_extraction_disabled(self):
+        block = Table(polygon=PolygonBox.from_bbox([0, 0, 100, 100]), page_id=0, block_id=0)
+        block.table_geometry = geometry(str(block.id), 1)
+        page = PageGroup(polygon=PolygonBox.from_bbox([0, 0, 100, 100]), page_id=0,
+                         children=[block], structure=[block.id], highres_image=Image.new("RGB", (100, 100)))
+        document = Document(filepath="scan.png", pages=[page])
+        LLMTableJSONProcessor(Mock(return_value={}),
+                              {"use_llm": True, "table_json_reconstruction": True, "extract_images": False})(document)
+        self.assertNotIn("<img", block.html or "")
+        self.assertEqual(block.embedded_images, {})
 
     def test_processor_accepts_valid_json_and_protects_source_grid(self):
         block = Table(polygon=PolygonBox.from_bbox([0, 0, 100, 100]), page_id=0, block_id=0, html="old")
@@ -223,6 +273,20 @@ class ExportTests(unittest.TestCase):
 
 
 class CloudServiceTests(unittest.TestCase):
+    def test_invalid_cloud_json_is_falsey_and_preserved_for_repair(self):
+        value = reconstruction([geometry("a", 1)]).model_dump()
+        value["tables"][0]["cells"][0]["role"] = "empty"
+        service = OpenAIService({"openai_api_key": "offline-placeholder", "openai_base_url": "https://ollama.com/v1"})
+        client = Mock()
+        client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(value)), finish_reason="stop")], usage=None)
+        service.get_client = Mock(return_value=client)
+        response = service("reconstruct", None, None, TableReconstruction)
+        self.assertIsInstance(response, InvalidLLMResponse)
+        self.assertFalse(response)
+        self.assertEqual(response.response, value)
+        self.assertTrue(any("role" in e for e in response.errors))
+
     def test_cloud_omits_unsupported_response_format_and_validates_json_locally(self):
         class Reply(BaseModel):
             value: str

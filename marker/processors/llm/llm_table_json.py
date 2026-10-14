@@ -9,6 +9,7 @@ from pydantic import ValidationError
 from marker.logger import get_logger
 from marker.processors.llm import BaseLLMProcessor
 from marker.schema import BlockTypes
+from marker.services import InvalidLLMResponse
 from marker.tables.geometry import CAPTION, crop_table
 from marker.tables.render import render_table
 from marker.tables.schema import TableReconstruction
@@ -45,6 +46,26 @@ class LLMTableJSONProcessor(BaseLLMProcessor):
                 run[0].table_json_report = {"status": "rejected", "errors": [type(error).__name__],
                                             "regions": [str(b.id) for b in run]}
                 run[0].update_metadata(llm_error_count=1)
+            if (run[0].table_json_report or {}).get("status") != "structurally_valid":
+                self.preserve_source_images(document, run)
+
+    def preserve_source_images(self, document, run):
+        """Keep a legible source when reconstruction fails, including diagrams.
+
+        The legacy text-layer table can be empty or omit formula glyphs. Its
+        HTML is kept when available, but cannot be the sole fallback.
+        """
+        if not self.extract_images:
+            return
+        source_images = []
+        for block in run:
+            name = f"{block.id.to_path()}_source.png"
+            block.embedded_images[name] = crop_table(document.get_page(block.page_id), block)[0]
+            block.html = (block.html or "") + (
+                '<p class="table-source">Таблица требует проверки; исходное изображение.</p>'
+                f'<p><img src="{name}" alt="Исходная таблица"></p>')
+            source_images.append({"region_id": str(block.id), "src": name})
+        run[0].table_json_report["source_images"] = source_images
 
     @staticmethod
     def candidate_continuation(document, previous, current):
@@ -72,14 +93,18 @@ class LLMTableJSONProcessor(BaseLLMProcessor):
         errors, warnings, response = [], [], None
         for _ in range(max(0, self.table_json_retries) + 1):
             response = self.llm_service(prompt, images, block, TableReconstruction)
-            try:
-                result = TableReconstruction.model_validate(response)
-                errors, warnings = validate_reconstruction(result, geometry)
-                if not errors:
-                    return result, [], warnings, response
-            except ValidationError as error:
-                errors = [f'{e["loc"]}: {e["msg"]}' for e in error.errors(include_input=False)]
+            if isinstance(response, InvalidLLMResponse):
+                errors, response = response.errors, response.response
+            else:
+                try:
+                    result = TableReconstruction.model_validate(response)
+                    errors, warnings = validate_reconstruction(result, geometry)
+                    if not errors:
+                        return result, [], warnings, response
+                except ValidationError as error:
+                    errors = [f'{e["loc"]}: {e["msg"]}' for e in error.errors(include_input=False)]
             prompt = (TABLE_PROMPT + "\n\nINPUT JSON:\n" + json.dumps(payload, ensure_ascii=False)
+                      + "\n\nПредыдущий ответ (не прошёл проверку):\n" + json.dumps(response, ensure_ascii=False)
                       + "\n\nПредыдущий ответ отклонён. Исправь перечисленные нарушения, сохрани все исходные данные:\n"
                       + json.dumps(errors[:30], ensure_ascii=False))
         return None, errors, warnings, response

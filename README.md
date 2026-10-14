@@ -1,6 +1,6 @@
 # Marker: PDF → Markdown и таблицы в JSON
 
-Форк [EyesHead/marker](https://github.com/EyesHead/marker/tree/codex/my-change) для конвертации русскоязычных PDF, включая СП и ГОСТ. Текст сохраняется в Markdown, таблицы — в HTML внутри Markdown и отдельном JSON с координатами, объединёнными ячейками, формулами и изображениями.
+Форк [EyesHead/marker](https://github.com/EyesHead/marker) для конвертации русскоязычных PDF, включая СП и ГОСТ. Текст сохраняется в Markdown, таблицы — в HTML внутри Markdown и отдельном JSON с координатами, объединёнными ячейками, формулами и изображениями.
 
 Основной вариант — **Ollama Cloud + Gemma 4 31B**. Gemma работает в облаке; Marker и OCR работают на вашем компьютере. Установка локальной Gemma не требуется.
 
@@ -10,7 +10,7 @@
 - Аккаунт Ollama и [API-ключ](https://ollama.com/settings/keys). Доступ к модели зависит от лимитов аккаунта.
 - PDF в папке `PDF` рядом со скриптом.
 
-Рабочая ветка с этими доработками: `codex/my-change`.
+Стабильная ветка с этими доработками: `master`.
 
 ## 1. Основной запуск на macOS: все PDF из папки
 
@@ -28,7 +28,7 @@ PolytechBrain/
 
 ```bash
 cd "$HOME/BRAIN_University/PolytechBrain"
-curl -fL https://raw.githubusercontent.com/EyesHead/marker/refs/heads/codex/my-change/ScriptMacOS-Ollama.sh -o ScriptMacOS-Ollama.sh
+curl -fL https://raw.githubusercontent.com/EyesHead/marker/refs/heads/master/ScriptMacOS-Ollama.sh -o ScriptMacOS-Ollama.sh
 chmod +x ScriptMacOS-Ollama.sh
 ```
 
@@ -56,7 +56,7 @@ FORCE=1 ./ScriptMacOS-Ollama.sh
 Один раз установите эту ветку в отдельное Python-окружение:
 
 ```bash
-git clone --branch codex/my-change https://github.com/EyesHead/marker.git
+git clone --branch master https://github.com/EyesHead/marker.git
 cd marker
 python3 -m venv .venv
 source .venv/bin/activate
@@ -88,6 +88,19 @@ marker_single "$HOME/BRAIN_University/PolytechBrain/PDF/document.pdf" \
 ```
 
 Для прямого облачного API используется имя `gemma4:31b`; суффикс `-cloud` не требуется. [Документация Ollama](https://docs.ollama.com/api/openai-compatibility).
+
+### PDF с текстовым слоем на Mac с ограниченной памятью
+
+Чтобы читать существующий текстовый слой без локального Surya VLM:
+
+```bash
+DISABLE_OCR=1 ./ScriptMacOS-Ollama.sh
+```
+
+В CLI добавьте `--disable_ocr`. Таблицы и исправление формул через Gemma
+продолжают работать в облаке. Этот режим подходит только для PDF с читаемым
+текстовым слоем: сканированные страницы он не распознаёт. Не совмещайте его
+с `FORCE_OCR=1`.
 
 ## 4. Сканы или PDF с повреждённым текстовым слоем
 
@@ -127,9 +140,9 @@ Output/document/
 
 Marker сначала извлекает текст и геометрию из PDF или координатного OCR. Gemma получает изображения таблиц вместе с этими данными и возвращает JSON. Код проверяет схему, покрытие сетки, пересечения объединённых ячеек, ссылки на блоки, координаты строк и колонок, числовую запись и парность разделителей формул.
 
-Продолжения таблиц сверяются по общим исходным блокам. HTML и изображения ячеек создаются кодом после проверки. Если JSON отклонён или требует проверки, прежняя таблица в Markdown сохраняется, а результат попадает в отчёт.
+Продолжения таблиц сверяются по общим исходным блокам. HTML и изображения ячеек создаются кодом после проверки. Если JSON отклонён или требует проверки, прежняя таблица в Markdown сохраняется вместе с исходным изображением, а результат попадает в отчёт. Скрипт сохраняет эти файлы и завершает работу с кодом `2`, чтобы такой результат не считался проверенным.
 
-`structurally_valid` означает успешную проверку структуры и привязок; он не гарантирует правильность каждого инженерного символа. Полный прогон Gemma на контрольном СП пока не выполнен.
+`structurally_valid` означает успешную проверку структуры и привязок; он не гарантирует правильность каждого инженерного символа. Проверка через облачную Gemma на пяти страницах контрольного СП (таблицы 2 и 8) выявила ошибки соответствия строк и координат: обе таблицы отклонены. Полный прогон СП пока не подтверждён; текущую реконструкцию сложных таблиц следует считать экспериментальной.
 
 Ollama Cloud [сейчас не поддерживает принудительные structured outputs](https://docs.ollama.com/capabilities/structured-outputs). Поэтому схема передаётся в промпте, температура равна 0, а валидация выполняется локально с ограниченными повторными попытками.
 

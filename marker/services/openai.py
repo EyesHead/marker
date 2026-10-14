@@ -9,10 +9,10 @@ import PIL
 from marker.logger import get_logger
 from openai import APITimeoutError, RateLimitError
 from PIL import Image
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from marker.schema.blocks import Block
-from marker.services import BaseService
+from marker.services import BaseService, InvalidLLMResponse
 
 logger = get_logger()
 
@@ -120,7 +120,16 @@ class OpenAIService(BaseService):
                 response_text = (response_text or "").strip()
                 if response_text.startswith("```json\n") and response_text.endswith("```"):
                     response_text = response_text[8:-3].strip()
-                return response_schema.model_validate_json(response_text).model_dump()
+                try:
+                    return response_schema.model_validate_json(response_text).model_dump()
+                except ValidationError as error:
+                    errors = [f'{e["loc"]}: {e["msg"]}' for e in error.errors(include_input=False)]
+                    try:
+                        candidate = json.loads(response_text)
+                    except json.JSONDecodeError:
+                        candidate = response_text
+                    logger.warning("LLM response failed schema validation (%d errors)", len(errors))
+                    return InvalidLLMResponse(candidate, errors)
             except (APITimeoutError, RateLimitError) as e:
                 # Rate limit exceeded
                 if tries == total_tries:
