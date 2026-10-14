@@ -21,7 +21,12 @@ def _intersection(a, b):
 
 
 def _bbox(obj):
-    return [float(obj[k]) for k in ('x0', 'top', 'x1', 'bottom')]
+    return tuple(float(obj[k]) for k in ('x0', 'top', 'x1', 'bottom'))
+
+
+def _layout_bbox(item):
+    """Physical bboxes stay fixed; only this separate box may be shifted."""
+    return item.get('layout_bbox', item['bbox'])
 
 
 def _line(x0, y0, x1, y1, orientation):
@@ -64,7 +69,7 @@ def _horizontal_border(edges, y, x0, x1):
 
 
 def _cuts(cells, first, last):
-    values = sorted({float(c['bbox'][i]) for c in cells for i in (first, last)})
+    values = sorted({float(_layout_bbox(c)[i]) for c in cells for i in (first, last)})
     result = []
     for value in values:
         if not result or not _near(value, result[-1]):
@@ -78,7 +83,7 @@ def grid_positions(grid):
     occupied = set()
     positions = []
     for cell in cells:
-        x0, y0, x1, y1 = cell['bbox']
+        x0, y0, x1, y1 = _layout_bbox(cell)
         c0, c1 = (min(range(len(xs)), key=lambda i: abs(xs[i]-x)) for x in (x0, x1))
         r0, r1 = (min(range(len(ys)), key=lambda i: abs(ys[i]-y)) for y in (y0, y1))
         slots = {(r, c) for r in range(r0, r1) for c in range(c0, c1)}
@@ -89,6 +94,46 @@ def grid_positions(grid):
     if len(occupied) != (len(xs)-1)*(len(ys)-1):
         return None
     return xs, ys, positions
+
+
+def _open_outer_edges(group, edges, content):
+    """Recover a disconnected side of a cell interrupted across a page break.
+
+    An isolated vertical edge must span the same height as the component,
+    stay within one existing column width, and enclose actual source content.
+    Closed independent components are never combined this way.
+    """
+    verticals = [edge for edge in group if edge['orientation'] == 'v']
+    horizontals = [edge for edge in group if edge['orientation'] == 'h']
+    if len(verticals) < 2 or len(horizontals) < 2:
+        return group
+    xs = sorted({edge['x0'] for edge in verticals})
+    if len(xs) < 2:
+        return group
+    y0, y1 = min(edge['top'] for edge in group), max(edge['bottom'] for edge in group)
+    if (_horizontal_border(group, y0, xs[0], xs[-1]) and
+            _horizontal_border(group, y1, xs[0], xs[-1])):
+        return group
+    pitch = max(b-a for a, b in zip(xs, xs[1:]))
+    result = list(group)
+    for edge in edges:
+        if edge in group or edge['orientation'] != 'v':
+            continue
+        x = edge['x0']
+        distance = min(abs(x-xs[0]), abs(x-xs[-1]))
+        if xs[0] <= x <= xs[-1] or distance > pitch*1.25:
+            continue
+        if not (_near(edge['top'], y0) and _near(edge['bottom'], y1)):
+            continue
+        if any(other['orientation'] == 'h' and
+               other['x0']-TOLERANCE <= x <= other['x1']+TOLERANCE and
+               edge['top']-TOLERANCE <= other['top'] <= edge['bottom']+TOLERANCE for other in edges):
+            continue  # A side connected to another grid is never an orphan.
+        strip = (min(x, xs[0]) if x < xs[0] else xs[-1], y0,
+                 xs[0] if x < xs[0] else max(x, xs[-1]), y1)
+        if any(_intersection(_bbox(item), strip) > 0 for item in content):
+            result.append(edge)
+    return result
 
 
 def extract_grids(pdf_page):
@@ -104,7 +149,8 @@ def extract_grids(pdf_page):
     edges = merge_edges(edges, TOLERANCE, TOLERANCE, 3, 3)
     words = pdf_page.extract_words(extra_attrs=['fontname', 'size'], x_tolerance=1.5, y_tolerance=2)
     result = []
-    for group in _components(edges):
+    for component in _components(edges):
+        group = _open_outer_edges(component, edges, [*words, *pdf_page.images])
         h = [e for e in group if e['orientation'] == 'h']
         v = [e for e in group if e['orientation'] == 'v']
         if len(h) < 2 or len(v) < 3:
@@ -130,11 +176,14 @@ def extract_grids(pdf_page):
         boxes = intersections_to_cells(edges_to_intersections(working, TOLERANCE, TOLERANCE))
         if len(boxes) < 2:
             continue
-        cells = [{'bbox': list(box), 'atoms': [],
+        page = pdf_page.page_number-1
+        cells = [{'bbox': tuple(box), 'source_bbox': tuple(box), 'source_page': page,
+                  'source_boxes': ((page, tuple(box)),), 'atoms': [],
                   'open_top': _near(box[1], y0) and not _horizontal_border(group, box[1], box[0], box[2]),
                   'open_bottom': _near(box[3], y1) and not _horizontal_border(group, box[3], box[0], box[2])}
                  for box in boxes]
-        grid = {'bbox': bounds, 'cells': cells, 'page': pdf_page.page_number-1}
+        grid = {'bbox': tuple(bounds), 'source_bbox': tuple(bounds), 'cells': cells,
+                'page': page, 'last_page': page, 'trusted': True, 'method': 'lines'}
         if not grid_positions(grid):
             continue
         atoms = [{'kind': 'text', 'bbox': _bbox(w), 'text': w['text'], 'size': float(w['size']),
@@ -151,6 +200,7 @@ def extract_grids(pdf_page):
             if overlap < area*0.8:
                 break
             atom['source_page'] = grid['page']
+            atom['source_bbox'] = atom['bbox']
             cell['atoms'].append(atom)
         else:
             if any(c['atoms'] for c in cells):
@@ -188,13 +238,13 @@ def render_grid(grid):
         for r, col, rowspan, colspan, cell in sorted(positions, key=lambda p: (p[0], p[1])):
             if r != row:
                 continue
-            x0, y0, x1, y1 = cell['bbox']
+            x0, y0, x1, y1 = _layout_bbox(cell)
             attrs = (f' rowspan="{rowspan}"' if rowspan > 1 else '') + (f' colspan="{colspan}"' if colspan > 1 else '')
             html.append(f'<td{attrs} style="padding:0;border:1px solid #888;vertical-align:top"><div style="position:relative;height:{y1-y0:.3f}pt;overflow:visible">')
             # Preserve absolute baselines inside large, unruled cells. The alpha
             # glyph and all six values therefore remain on the same source line.
-            for atom in sorted(cell['atoms'], key=lambda a: (a['bbox'][1], a['bbox'][0])):
-                ax0, ay0, ax1, ay1 = atom['bbox']
+            for atom in sorted(cell['atoms'], key=lambda a: (_layout_bbox(a)[1], _layout_bbox(a)[0])):
+                ax0, ay0, ax1, ay1 = _layout_bbox(atom)
                 placement = f'position:absolute;left:{(ax0-x0)/(x1-x0)*100:.4f}%;top:{ay0-y0:.3f}pt;'
                 if atom['kind'] == 'image':
                     if not atom.get('src'):
@@ -217,7 +267,7 @@ def render_grid(grid):
 
 
 def can_join_grids(first, second):
-    if first['page'] + 1 != second['page']:
+    if first.get('last_page', first['page']) + 1 != second['page']:
         return False
     if not all(_near(first['bbox'][i], second['bbox'][i]) for i in (0, 2)):
         return False
@@ -230,23 +280,53 @@ def can_join_grids(first, second):
 def join_grids(first, second):
     if not can_join_grids(first, second):
         return None
+    return stack_grids(first, second, merge_open=True)
+
+
+def stack_grids(first, second, *, merge_open=False):
+    """Build a virtual layout, retaining all original boxes and source parts.
+
+    A joined cell has one physical ``bbox`` for its first fragment and a
+    ``source_boxes`` tuple for every fragment. Its full display extent lives
+    in ``layout_bbox``. Atoms always crop through source_page/source_bbox.
+    """
+    if first.get('last_page', first['page']) + 1 != second['page']:
+        return None
+    if not all(_near(first['bbox'][i], second['bbox'][i]) for i in (0, 2)):
+        return None
     merged = deepcopy(first)
     following = deepcopy(second)
-    shift = first['bbox'][3]-second['bbox'][1]
+    first_box, second_box = _layout_bbox(first), _layout_bbox(second)
+    shift = first_box[3]-second_box[1]
+    for grid in (merged, following):
+        for cell in grid['cells']:
+            cell.setdefault('source_page', grid['page'])
+            cell.setdefault('source_bbox', tuple(cell['bbox']))
+            cell.setdefault('source_boxes', ((cell['source_page'], cell['source_bbox']),))
+            for atom in cell['atoms']:
+                atom.setdefault('source_page', grid['page'])
+                atom.setdefault('source_bbox', tuple(atom['bbox']))
     for cell in following['cells']:
         for item in [cell, *cell['atoms']]:
-            item['bbox'][1] += shift
-            item['bbox'][3] += shift
+            box = _layout_bbox(item)
+            item['layout_bbox'] = (box[0], box[1]+shift, box[2], box[3]+shift)
     for cell in merged['cells']:
-        if not cell['open_bottom']:
+        if not merge_open or not cell.get('open_bottom'):
             continue
-        partner = next(c for c in following['cells'] if c['open_top'] and _near(cell['bbox'][0], c['bbox'][0]) and _near(cell['bbox'][2], c['bbox'][2]))
-        cell['bbox'][3] = partner['bbox'][3]
+        partner = next((c for c in following['cells'] if c.get('open_top') and
+                        _near(cell['bbox'][0], c['bbox'][0]) and _near(cell['bbox'][2], c['bbox'][2])), None)
+        if partner is None:
+            return None
+        box = _layout_bbox(cell)
+        cell['layout_bbox'] = (box[0], box[1], box[2], partner['layout_bbox'][3])
         cell['atoms'].extend(partner['atoms'])
+        cell['source_boxes'] += partner['source_boxes']
         cell['open_bottom'] = partner['open_bottom']
         following['cells'].remove(partner)
     merged['cells'].extend(following['cells'])
-    merged['bbox'][3] = following['bbox'][3]+shift
-    # The endpoint page allows a third continuation to join the same table.
-    merged['page'] = second['page']
+    merged['layout_bbox'] = (first_box[0], first_box[1], first_box[2], second_box[3]+shift)
+    merged['last_page'] = second.get('last_page', second['page'])
+    merged['source_parts'] = first.get('source_parts', ((first['page'], tuple(first['bbox'])),)) + second.get(
+        'source_parts', ((second['page'], tuple(second['bbox'])),))
+    merged['trusted'] = first.get('trusted', True) and second.get('trusted', True)
     return merged if grid_positions(merged) else None
