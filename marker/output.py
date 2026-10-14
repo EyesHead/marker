@@ -99,4 +99,5 @@ def save_output(rendered: BaseModel, output_dir: str, fname_base: str):
 
     for img_name, img in images.items():
         img = convert_if_not_rgb(img)  # RGBA images can't save as JPG
-        img.save(os.path.join(output_dir, img_name), settings.OUTPUT_IMAGE_FORMAT)
+        image_format = "PNG" if img_name.lower().endswith(".png") else settings.OUTPUT_IMAGE_FORMAT
+        img.save(os.path.join(output_dir, img_name), image_format)

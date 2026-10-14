@@ -123,6 +123,10 @@ class BaseLLMProcessor(BaseProcessor):
                     continue
 
                 if hasattr(block, "html"):
+                    if getattr(block, "table_grid", None):
+                        # Page-wide text correction must not change verified
+                        # cell boundaries, baselines or source image placement.
+                        continue
                     embedded_images = getattr(block, "embedded_images", {})
                     if embedded_images and any(
                         name not in block_data["html"] for name in embedded_images

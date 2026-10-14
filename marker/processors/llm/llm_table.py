@@ -12,6 +12,7 @@ from marker.schema.blocks import Block, TableCell, Table
 from marker.schema.document import Document
 from marker.schema.groups.page import PageGroup
 from marker.schema.polygon import PolygonBox
+from marker.processors.table_geometry import render_grid
 
 logger = get_logger()
 
@@ -119,6 +120,9 @@ score: 5
             return image.rotate(90, expand=True)
 
     def process_rewriting(self, document: Document, page: PageGroup, block: Table):
+        if block.table_grid:
+            self.annotate_geometry_formulas(document, block)
+            return
         children: List[TableCell] = block.contained_blocks(
             document, (BlockTypes.TableCell,)
         )
@@ -228,6 +232,32 @@ score: 5
         block.html = block_html
 
         block.html = self.embed_table_images(block, block.html, block_image)
+
+    def annotate_geometry_formulas(self, document, block):
+        atoms = [a for c in block.table_grid['cells'] for a in c['atoms'] if a['kind'] == 'image' and a.get('src')
+                 and a['bbox'][2]-a['bbox'][0] < 250 and a['bbox'][3]-a['bbox'][1] < 80]
+        if not atoms or not self.llm_service:
+            return
+        references = '\n'.join(f'{i+1}: {a["src"]}; PDF bbox={a["bbox"]}' for i, a in enumerate(atoms))
+        prompt = r'''Transcribe only the mathematical content of the listed image crops into LaTeX.
+The first image is the table for context; subsequent images correspond to the list in order.
+The cell grid and all image positions are already fixed from the PDF. Do not reconstruct or change the table.
+Use source_id exactly as listed. Preserve subscripts, superscripts, fractions, decimal commas and printed Greek glyphs.
+Distinguish \phi from \varphi by the image. For a diagram or unreadable crop, return an empty latex string.
+Return formulas with source_id and latex. Do not include dollar delimiters, HTML or descriptions.
+''' + references
+        images = [self.extract_image(document, block)] + [block.embedded_images[a['src']] for a in atoms]
+        response = self.llm_service(prompt, images, block, FormulaTranscriptions)
+        if not response or not isinstance(response.get('formulas'), list):
+            block.update_metadata(llm_error_count=1)
+            return
+        known = {a['src']: a for a in atoms}
+        for formula in response['formulas']:
+            source = formula.get('source_id')
+            latex = formula.get('latex')
+            if source in known and isinstance(latex, str) and len(latex) < 2500:
+                known[source]['latex'] = latex.strip().strip('$')
+        block.html = render_grid(block.table_grid)
 
     def rewrite_single_chunk(
         self,
@@ -412,3 +442,12 @@ class TableSchema(BaseModel):
     corrected_html: str
     analysis: str
     score: int
+
+
+class FormulaTranscription(BaseModel):
+    source_id: str
+    latex: str
+
+
+class FormulaTranscriptions(BaseModel):
+    formulas: List[FormulaTranscription]

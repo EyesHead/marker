@@ -12,6 +12,7 @@ from marker.schema import BlockTypes
 from marker.schema.blocks import Block, TableCell
 from marker.schema.document import Document
 from marker.logger import get_logger
+from marker.processors.table_geometry import can_join_grids, join_grids, render_grid
 
 logger = get_logger()
 
@@ -269,6 +270,8 @@ Table 2
                     )
                     merge_condition = any(
                         [
+                            bool(getattr(prev_block, "table_grid", None) and getattr(block, "table_grid", None)
+                                 and can_join_grids(prev_block.table_grid, block.table_grid)),
                             subsequent_page_table,
                             edge_continuation,
                             same_page_vertical_table,
@@ -322,6 +325,17 @@ Table 2
         start_block = blocks[0]
         for i in range(1, len(blocks)):
             curr_block = blocks[i]
+            if start_block.table_grid and curr_block.table_grid:
+                merged = join_grids(start_block.table_grid, curr_block.table_grid)
+                if merged is not None:
+                    start_block.table_grid = merged
+                    start_block.html = render_grid(merged)
+                    start_block.embedded_images.update(curr_block.embedded_images)
+                    curr_block.ignore_for_output = True
+                    curr_block.structure = []
+                    curr_block.html = None
+                    curr_block.embedded_images.clear()
+                    continue
             children = start_block.contained_blocks(document, (BlockTypes.TableCell,))
             children_curr = curr_block.contained_blocks(
                 document, (BlockTypes.TableCell,)

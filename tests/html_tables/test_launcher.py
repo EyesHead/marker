@@ -65,6 +65,12 @@ class LauncherTests(unittest.TestCase):
             self.assertNotIn("offline-placeholder", args)
 
     def test_json_cache_migrates_to_html_once(self):
+        self.check_cache_migration(legacy_json=True)
+
+    def test_previous_html_cache_migrates_to_geometry_once(self):
+        self.check_cache_migration(legacy_json=False)
+
+    def check_cache_migration(self, legacy_json):
         script = (Path(__file__).parents[2] / "ScriptMacOS-Ollama.sh").read_text()
         cache_code = "repo_origin=" + script.split("\nrepo_origin=", 1)[1].split("\nWORK_ROOT=", 1)[0]
         def git(*args):
@@ -79,6 +85,7 @@ class LauncherTests(unittest.TestCase):
             table = remote / "marker/processors/llm/llm_table.py"
             table.parent.mkdir(parents=True)
             table.write_text('data-bbox')
+            (remote / "marker/processors/table_geometry.py").write_text('# physical grid extraction')
             converter = remote / "marker/converters/pdf.py"
             converter.parent.mkdir(parents=True)
             converter.write_text('page_batch_size')
@@ -91,7 +98,9 @@ class LauncherTests(unittest.TestCase):
             git("-C", str(source), "config", "user.email", "offline@example.invalid")
             git("-C", str(source), "config", "user.name", "Offline test")
             legacy = source / "marker/processors/llm/llm_table_json.py"
-            legacy.write_text('# legacy JSON reconstruction')
+            if legacy_json:
+                legacy.write_text('# legacy JSON reconstruction')
+            (source / 'marker/processors/table_geometry.py').unlink()
             git("-C", str(source), "add", ".")
             git("-C", str(source), "commit", "-m", "Legacy JSON workflow")
             (cache / "installed-revision").write_text(git("-C", str(source), "rev-parse", "HEAD"))

@@ -1,6 +1,8 @@
 from collections import Counter
+import os
 from typing import Annotated, List
 
+import pdfplumber
 from bs4 import BeautifulSoup
 from surya.layout.schema import LayoutBox, LayoutResult
 from surya.recognition import RecognitionPredictor, _detect_repeat_loop
@@ -15,6 +17,9 @@ from marker.schema.document import Document
 from marker.schema.labels import block_type_to_surya_label
 from marker.util import matrix_intersection_area
 from marker.logger import get_logger
+from marker.processors.table_geometry import attach_images, extract_grids, render_grid, _intersection
+from marker.schema.blocks import Table
+from marker.schema.polygon import PolygonBox
 
 logger = get_logger()
 
@@ -24,8 +29,10 @@ class TableProcessor(BaseProcessor):
 
     - Scanned/garbled pages are full-page OCR'd by the OcrBuilder, which already
       sets ``block.html`` on their Table blocks - those are left untouched.
-    - Digital (pdftext) tables are reconstructed from the PDF text layer with
-      CPU-only heuristics (see ``table_recon``), which emit the table HTML.
+    - Ruled digital tables use PDF lines to define physical cells. Text and
+      raster formulas are placed by source coordinates, including unruled
+      content bands and headers interrupted by a page boundary.
+    - Tables without a reliable vector grid use text-layer heuristics.
     - A digital table the heuristics can't resolve (sparse, vector-drawn, low
       score) falls back to OCRing the table crop with the recognition model.
 
@@ -54,6 +61,8 @@ class TableProcessor(BaseProcessor):
         "Whether to disable the tqdm progress bar.",
     ] = False
     disable_ocr: Annotated[bool, "Disable OCR entirely."] = False
+    extract_images: Annotated[bool, "Preserve source images inside table cells."] = True
+    table_geometry: Annotated[bool, "Build ruled PDF tables from physical cell coordinates."] = True
 
     def __init__(
         self,
@@ -67,6 +76,7 @@ class TableProcessor(BaseProcessor):
         self.table_stats = Counter()
 
     def __call__(self, document: Document):
+        self.prepare_geometry_tables(document)
         tables_by_page = self.collect_tables(document)
         total = sum(len(v) for v in tables_by_page.values())
         if not total:
@@ -78,7 +88,7 @@ class TableProcessor(BaseProcessor):
                 # Scanned/garbled pages: the full-page OCR already produced the
                 # table HTML - trust it, don't redo.
                 if block.html:
-                    self.table_stats["tables_ocr"] += 1
+                    self.table_stats["tables_geometry" if getattr(block, "table_grid", None) else "tables_ocr"] += 1
                     continue
 
                 html = self.reconstruct_digital_table(page, block)
@@ -99,6 +109,38 @@ class TableProcessor(BaseProcessor):
 
         self.table_stats["tables_total"] = total
         logger.info(f"Table processing stats: {dict(self.table_stats)}")
+
+    def prepare_geometry_tables(self, document):
+        if not self.table_geometry or not os.path.isfile(document.filepath) or not document.filepath.lower().endswith('.pdf'):
+            return
+        with pdfplumber.open(document.filepath) as pdf:
+            for page in document.pages:
+                source = pdf.pages[page.page_id]
+                grids = extract_grids(source)
+                existing = list(page.contained_blocks(document, (BlockTypes.Table,)))
+                for grid in grids:
+                    matching = [b for b in existing if _intersection(b.polygon.bbox, grid['bbox']) > min(b.polygon.area, (grid['bbox'][2]-grid['bbox'][0])*(grid['bbox'][3]-grid['bbox'][1]))*0.8]
+                    if matching:
+                        block = max(matching, key=lambda b: _intersection(b.polygon.bbox, grid['bbox']))
+                        for other in matching:
+                            existing.remove(other)
+                            if other is not block:
+                                other.ignore_for_output = True
+                                other.structure = []
+                    else:
+                        block = page.add_full_block(Table(page_id=page.page_id, polygon=PolygonBox.from_bbox(grid['bbox'])))
+                        structure = list(page.structure or [])
+                        position = next((i for i, bid in enumerate(structure) if document.get_block(bid).polygon.y_start > grid['bbox'][1]), len(structure))
+                        structure.insert(position, block.id)
+                        page.structure = structure
+                    block.polygon = PolygonBox.from_bbox(grid['bbox'])
+                    block.table_grid = grid
+                    if self.extract_images:
+                        attach_images(grid, block, page)
+                    block.html = render_grid(grid)
+                    block.structure = []
+                    block.text_extraction_method = 'pdftext'
+                source.close()
 
     def collect_tables(self, document: Document) -> dict:
         return {

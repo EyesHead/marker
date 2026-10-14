@@ -173,15 +173,17 @@ if [ "$repo_origin" != "$MARKER_REPO" ]; then
     echo "Ошибка: кэш $MARKER_ROOT принадлежит другому репозиторию: $repo_origin" >&2
     exit 1
 fi
-# Старый JSON-конвейер заменяем один раз; обычные запуски не обращаются к GitHub.
+# На сборку таблиц по координатам переходим один раз. Обычные запуски
+# используют кэш и не обращаются к GitHub.
 # UPDATE_MARKER=1 позволяет явно обновить установленную версию позднее.
 if [ -f "$MARKER_ROOT/marker/processors/llm/llm_table_json.py" ] || \
+   [ ! -f "$MARKER_ROOT/marker/processors/table_geometry.py" ] || \
    [ "${UPDATE_MARKER:-0}" = "1" ]; then
     if [ -n "$(git -C "$MARKER_ROOT" status --porcelain)" ]; then
         echo "Ошибка: в кэше Marker есть изменения; обновите его вручную: $MARKER_ROOT" >&2
         exit 1
     fi
-    echo "Обновляю Marker для HTML-таблиц с изображениями..."
+    echo "Обновляю Marker для HTML-таблиц по координатам PDF..."
     if ! git -C "$MARKER_ROOT" fetch --depth 1 origin "$MARKER_REF" || \
        ! git -C "$MARKER_ROOT" checkout --detach FETCH_HEAD; then
         echo "Ошибка: не удалось обновить кэш Marker." >&2
@@ -194,6 +196,7 @@ if [ -f "$MARKER_ROOT/marker/processors/llm/llm_table_json.py" ]; then
     exit 1
 fi
 if ! grep -q 'page_batch_size' "$MARKER_ROOT/marker/converters/pdf.py" || \
+   [ ! -f "$MARKER_ROOT/marker/processors/table_geometry.py" ] || \
    ! grep -q 'data-bbox' "$MARKER_ROOT/marker/processors/llm/llm_table.py"; then
     echo "Ошибка: скачанная версия Marker не содержит нужных доработок." >&2
     echo "Кэш: $MARKER_ROOT. Репозиторий: $MARKER_REPO" >&2
@@ -228,6 +231,7 @@ trap 'exit 143' TERM
 export PYTHONPATH="$MARKER_ROOT"
 echo "Marker: $MARKER_ROOT ($repo_revision)"
 echo "LLM: облачный Ollama API, модель $OLLAMA_MODEL."
+echo "Таблицы: сетка по границам PDF; формулы и рисунки сохраняются в исходных ячейках."
 echo "Пакет страниц: $PAGE_BATCH_SIZE; на каждый PDF один запуск Marker."
 
 failed=0

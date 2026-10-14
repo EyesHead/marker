@@ -12,6 +12,7 @@ class BaseTable(Block):
     block_type: BlockTypes | None = None
     html: str | None = None
     embedded_images: Dict[str, Image.Image] = Field(default_factory=dict)
+    table_grid: dict | None = None  # Internal PDF coordinates; not a JSON export.
 
     @staticmethod
     def format_cells(
