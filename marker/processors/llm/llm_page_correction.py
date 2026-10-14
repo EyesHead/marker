@@ -262,6 +262,8 @@ User Prompt
                     continue
 
                 if hasattr(block, "html"):
+                    if getattr(block, "table_grid", None):
+                        continue
                     block.html = block_data["html"]
             except Exception as e:
                 logger.debug(f"Error parsing block ID {block_data['id']}: {e}")

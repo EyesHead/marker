@@ -12,6 +12,7 @@ from marker.output import save_output
 from marker.processors.table_geometry import extract_grids, attach_images, render_grid, grid_positions
 from marker.processors.llm.llm_table import LLMTableProcessor
 from marker.processors.llm import BaseLLMProcessor
+from marker.processors.llm.llm_page_correction import LLMPageCorrectionProcessor
 from marker.renderers.markdown import MarkdownRenderer
 from marker.schema.blocks import Table
 from marker.schema.document import Document
@@ -79,8 +80,11 @@ class GeometryContractTests(unittest.TestCase):
         document, table = document_fixture()
         original = table.html
         rewritten = '<table><tr><td>'+''.join(f'<img src="{n}">' for n in table.embedded_images)+'</td></tr></table>'
-        BaseLLMProcessor(Mock(), {'use_llm':True}).handle_rewrites([{'id':str(table.id),'html':rewritten}], document)
-        self.assertEqual(table.html, original)
+        for cls in (BaseLLMProcessor, LLMPageCorrectionProcessor):
+            with self.subTest(processor=cls.__name__):
+                table.html = original
+                cls(Mock(), {'use_llm':True}).handle_rewrites([{'id':str(table.id),'html':rewritten}], document)
+                self.assertEqual(table.html, original)
 
     def test_saved_formula_resources_are_actual_png_files(self):
         document, table = document_fixture()
