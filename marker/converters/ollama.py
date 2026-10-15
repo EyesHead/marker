@@ -24,9 +24,13 @@ from marker.cloud.regions import Region, analyze_page, assess_text_quality
 from marker.cloud.source import PdfSource, intersection
 from marker.cloud.tables import TablePart, detect_tables, group_tables, recognize_table
 from marker.converters import BaseConverter
+from marker.logger import get_logger
 from marker.processors.table_geometry import grid_positions
 from marker.renderers.markdown import MarkdownOutput
 from marker.util import assign_config
+
+
+logger = get_logger()
 
 
 class LayoutLine(BaseModel):
@@ -218,6 +222,7 @@ class OllamaPdfConverter(BaseConverter):
     cloud_max_output_tokens: Annotated[int, "Maximum cloud response tokens."] = 2048
     cloud_max_images: Annotated[int, "Maximum images per cloud request."] = 3
     cloud_max_attempts: Annotated[int, "Total attempts including repairs."] = 3
+    cloud_max_concurrency: Annotated[int, "Independent table HTTP requests in flight (1-4)."] = 1
     cloud_max_requests: Annotated[
         int, "Document request cap; zero means unlimited."
     ] = 0
@@ -255,6 +260,7 @@ class OllamaPdfConverter(BaseConverter):
             "cloud_max_output_tokens",
             "cloud_max_images",
             "cloud_max_attempts",
+            "cloud_max_concurrency",
             "cloud_max_requests",
             "cloud_model",
             "cloud_base_url",
@@ -316,14 +322,20 @@ class OllamaPdfConverter(BaseConverter):
                 self.page_range if self.page_range is not None else range(len(source))
             )
             native_parts = {}
-            for page in pages:
+            logger.info("Cloud conversion: discovering source pages (%s)", len(pages))
+            for page_number, page in enumerate(pages, 1):
+                logger.info("Cloud conversion: source page %s/%s; requests=%s",
+                            page_number, len(pages), self.client.request_count)
                 if page < 0 or page >= len(source):
                     reasons.append(f"Page {page}: requested page is outside document")
                     continue
                 try:
-                    for part in detect_tables(source, [page]):
+                    page_parts = detect_tables(source, [page])
+                    for part in page_parts:
                         native_parts[(part.page, part.bbox)] = part
-                    page_regions = group_expression_regions(analyze_page(source, page))
+                    page_regions = group_expression_regions(
+                        analyze_page(source, page, table_parts=page_parts)
+                    )
                 except RecognitionFailure as error:
                     box = (0.0, 0.0, *source.page_size(page))
                     region = Region(
@@ -337,6 +349,8 @@ class OllamaPdfConverter(BaseConverter):
                         regions.append(region)
                         continue
                     try:
+                        logger.info("Cloud conversion: page %s layout; requests=%s",
+                                    page + 1, self.client.request_count)
                         regions.extend(scan_layout(source, region, self.client))
                     except RecognitionFailure as error:
                         result = self._unresolved(source, region, error.reason)
@@ -349,7 +363,12 @@ class OllamaPdfConverter(BaseConverter):
                 for r in regions
                 if r.kind == "table"
             ]
-            for table in group_tables(parts, self.client):
+            logger.info("Cloud conversion: grouping table parts (%s); requests=%s",
+                        len(parts), self.client.request_count)
+            tables = group_tables(parts, self.client)
+            for table_number, table in enumerate(tables, 1):
+                logger.info("Cloud conversion: table %s/%s; requests=%s",
+                            table_number, len(tables), self.client.request_count)
                 part = table.parts[0]
                 table_regions = [
                     r
@@ -416,9 +435,12 @@ class OllamaPdfConverter(BaseConverter):
                 result = recognize_table(source, table, self.client)
                 outputs.append((part.page, part.bbox[1], part.bbox[0], result))
             inline_results = {}
-            for region in group_expression_regions(
+            content_regions = group_expression_regions(
                 [r for r in regions if r.kind != "table"]
-            ):
+            )
+            for region_number, region in enumerate(content_regions, 1):
+                logger.info("Cloud conversion: source region %s/%s; requests=%s",
+                            region_number, len(content_regions), self.client.request_count)
                 if region.inline_group:
                     inline_results.setdefault(region.inline_group, []).append(
                         (region.bbox[0], self._recognize(source, region))

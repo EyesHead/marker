@@ -78,7 +78,8 @@ def respond(source, attempt):
                         part["text"] = "Scanned baseline " + line["id"]
         return output
     if source.get("required_kind") == "math":
-        return {"kind": "math", "resolved": True, "latex": r"x \geq 0"}
+        text = "".join(a.get("text", "") for a in source.get("atoms", []))
+        return {"kind": "math", "resolved": True, "latex": "x^2" if text == "x2" else r"x \geq 0"}
     if source.get("required_kind") in ("unknown", "image", "figure"):
         return {"kind": "figure", "resolved": True}
     return {"kind": "text", "resolved": True, "text": "Recovered scanned paragraph"}
@@ -472,10 +473,10 @@ class AdaptiveConverterTests(unittest.TestCase):
         from marker.cloud.regions import analyze_page
         from marker.converters.ollama import OllamaPdfConverter
 
-        def analyze(source, page):
+        def analyze(source, page, **kwargs):
             if page == 1:
                 raise RecognitionFailure("Required source region could not be analyzed")
-            return analyze_page(source, page)
+            return analyze_page(source, page, **kwargs)
 
         client, observed = offline_client(respond)
         with patch("marker.converters.ollama.analyze_page", side_effect=analyze):

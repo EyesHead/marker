@@ -6,6 +6,7 @@ metadata all use that same basis. Request sizing belongs to CloudClient.
 """
 
 from contextlib import ExitStack
+from copy import deepcopy
 from dataclasses import dataclass
 from math import ceil, floor, hypot, isfinite
 from pathlib import Path
@@ -165,6 +166,7 @@ class PdfSource:
         self._pages = {}
         self._views = {}
         self._images = {}
+        self._words = {}
         self._char_boxes = {}
 
     def __enter__(self):
@@ -188,6 +190,7 @@ class PdfSource:
         self._pages.clear()
         self._views.clear()
         self._images.clear()
+        self._words.clear()
         self._char_boxes.clear()
         if self._stack is not None:
             self._stack.close()
@@ -275,14 +278,19 @@ class PdfSource:
         return word
 
     def page_words(self, page, bbox=None):
-        words = self.pdf_page(page).extract_words(
-            extra_attrs=["fontname", "size"], x_tolerance=1.5, y_tolerance=2
-        )
-        for word in words:
-            word.update(kind="text", source_page=page, source_bbox=word["bbox"])
-        return [word for word in words if bbox is None or intersection(word["bbox"], bbox) > 0 or
-                (bbox[0] <= word['x0'] <= bbox[2] and bbox[1] <= word['top'] <= bbox[3] and
-                 (word['width'] <= 0 or word['height'] <= 0))]
+        if page not in self._words:
+            words = self.pdf_page(page).extract_words(
+                extra_attrs=["fontname", "size"], x_tolerance=1.5, y_tolerance=2
+            )
+            for word in words:
+                word.update(kind="text", source_page=page, source_bbox=word["bbox"])
+            self._words[page] = deepcopy(words)
+        # A caller can change an atom while assembling its owned region. Keep
+        # those changes separate from both the cache and every later caller.
+        return deepcopy([word for word in self._words[page]
+                         if bbox is None or intersection(word["bbox"], bbox) > 0 or
+                         (bbox[0] <= word['x0'] <= bbox[2] and bbox[1] <= word['top'] <= bbox[3] and
+                          (word['width'] <= 0 or word['height'] <= 0))])
 
     def _image_bounds(self, page, obj):
         # PDFium child bounds include the image's own matrix, but omit every

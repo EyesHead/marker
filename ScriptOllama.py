@@ -2,6 +2,7 @@
 """Portable, standard-library launcher for adaptive Ollama Cloud conversion."""
 
 import argparse
+import codecs
 import getpass
 import json
 import os
@@ -87,15 +88,69 @@ def request_api_key():
         return None
 
 
+class _SecretRedactor:
+    """Redact complete credentials even when reads split their characters."""
+
+    def __init__(self, secret):
+        self.secret = secret
+        self.pending = ""
+
+    def feed(self, text, *, final=False):
+        text = self.pending + text
+        self.pending = ""
+        if not self.secret:
+            return text
+        pieces, offset = [], 0
+        while True:
+            match = text.find(self.secret, offset)
+            if match < 0:
+                break
+            pieces.extend((text[offset:match], "[redacted]"))
+            offset = match + len(self.secret)
+        tail = text[offset:]
+        keep = 0 if final else min(len(tail), len(self.secret) - 1)
+        while keep and not tail.endswith(self.secret[:keep]):
+            keep -= 1
+        if keep:
+            self.pending = tail[-keep:]
+            tail = tail[:-keep]
+        pieces.append(tail)
+        return "".join(pieces)
+
+
 class Processes:
     def __init__(self, secret):
         self.secret = secret
         self.env = nonsecret_environment()
-        self.env.update(PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
+        self.env.update(PYTHONUTF8="1", PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
 
     def message(self, text, *, error=False):
         text = str(text).replace(self.secret, "[redacted]") if self.secret else str(text)
-        print(text, file=sys.stderr if error else sys.stdout)
+        print(text, file=sys.stderr if error else sys.stdout, flush=True)
+
+    def _stream_conversion(self, args, *, cwd, env):
+        # One pipe preserves ordering when a credential is split between the
+        # child's stdout/stderr. Decode incrementally before redacting so UTF-8
+        # characters split by an OS pipe read remain intact.
+        redactor = _SecretRedactor(self.secret)
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        output = []
+
+        def emit(text):
+            if text:
+                output.append(text)
+                sys.stdout.write(text)
+                sys.stdout.flush()
+
+        with subprocess.Popen(args, cwd=cwd, env=env, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT) as process:
+            while True:
+                chunk = process.stdout.read1(4096)
+                if not chunk:
+                    break
+                emit(redactor.feed(decoder.decode(chunk)))
+            emit(redactor.feed(decoder.decode(b"", final=True), final=True))
+            return subprocess.CompletedProcess(args, process.wait(), "".join(output), "")
 
     def run(self, args, *, cwd=None, conversion=False, quiet=False):
         env = dict(self.env)
@@ -103,6 +158,8 @@ class Processes:
             env["OLLAMA_API_KEY"] = self.secret
             env["PYTHONPATH"] = str(cwd)
         try:
+            if conversion:
+                return self._stream_conversion(list(map(str, args)), cwd=cwd, env=env)
             result = subprocess.run(list(map(str, args)), cwd=cwd, env=env,
                                     capture_output=True, text=True, encoding="utf-8", errors="replace")
         except OSError as error:
@@ -197,7 +254,7 @@ def conversion_arguments(args, python, pdf, output):
                "--openai_base_url", args.base_url, "--openai_model", args.model,
                "--openai_image_format", "png", "--max_concurrency", "1", "--timeout", "180",
                "--page_batch_size", args.page_batch_size, "--redo_inline_math"]
-    for field in ("context_tokens", "max_output_tokens", "max_images", "crop_dpi", "max_attempts", "max_requests"):
+    for field in ("context_tokens", "max_output_tokens", "max_images", "crop_dpi", "max_attempts", "max_requests", "max_concurrency"):
         command.extend(["--cloud_" + field, getattr(args, field)])
     if args.disable_ocr:
         command.append("--disable_ocr")
@@ -247,7 +304,7 @@ def parse_arguments(argv):
     parser.add_argument("--model", default=os.environ.get("OLLAMA_MODEL", "gemma4:31b"))
     parser.add_argument("--base-url", default=os.environ.get("OLLAMA_BASE_URL", "https://ollama.com/v1"))
     for name, default in (("context_tokens", 8192), ("max_output_tokens", 2048),
-                          ("max_images", 3), ("crop_dpi", 600), ("max_attempts", 3), ("max_requests", 0)):
+                          ("max_images", 3), ("crop_dpi", 600), ("max_attempts", 3), ("max_requests", 0), ("max_concurrency", 2)):
         parser.add_argument("--" + name.replace("_", "-"), type=int,
                             default=os.environ.get("CLOUD_" + name.upper(), default))
     parser.add_argument("--page-batch-size", type=int, default=os.environ.get("PAGE_BATCH_SIZE", 30))
@@ -260,6 +317,8 @@ def parse_arguments(argv):
             parser.error(name.replace("_", "-") + " must be positive")
     if args.max_requests < 0 or args.context_tokens <= args.max_output_tokens:
         parser.error("max-requests must be >= 0; context-tokens must exceed max-output-tokens")
+    if not 1 <= args.max_concurrency <= 4:
+        parser.error("max-concurrency must be between 1 and 4")
     if args.disable_ocr and args.force_ocr:
         parser.error("DISABLE_OCR=1 and FORCE_OCR=1 cannot be combined")
     args.directory = args.directory.expanduser().resolve()

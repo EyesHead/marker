@@ -106,7 +106,7 @@ def _bounds(atoms):
     return min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes)
 
 
-def analyze_page(source, page) -> list[Region]:
+def analyze_page(source, page, *, table_parts=None) -> list[Region]:
     """Enumerate digital tables, images and text; expose remaining unknown areas.
 
     Scanned layout detection belongs to the adaptive converter. Here a scan is
@@ -117,7 +117,7 @@ def analyze_page(source, page) -> list[Region]:
     width, height = source.page_size(page)
     words = source.page_words(page)
     regions = []
-    parts = detect_tables(source, [page])
+    parts = detect_tables(source, [page]) if table_parts is None else table_parts
     for part in parts:
         atoms = tuple(atom for cell in part.grid["cells"] for atom in cell["atoms"])
         regions.append(Region(page, part.bbox, "table", atoms, source.text_quality(page, part.bbox), grid=part.grid))

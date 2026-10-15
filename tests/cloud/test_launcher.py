@@ -19,6 +19,7 @@ from unittest.mock import patch
 
 LAUNCHER = Path(__file__).resolve().parents[2] / "ScriptOllama.py"
 RUN = subprocess.run
+POPEN = subprocess.Popen
 KEY = "DISTINCTIVE_DUMMY_OLLAMA_KEY_9472_keep_in_memory"
 
 
@@ -91,6 +92,27 @@ class OfflineProcesses:
     def installs(self):
         return [call for call in self.calls if "pip" in call[0]]
 
+    def popen(self, args, **kwargs):
+        if "marker.scripts.convert_single" not in args:
+            return POPEN(args, **kwargs)
+        result = self(args, env=kwargs.get("env"), cwd=kwargs.get("cwd"))
+
+        class ConversionProcess:
+            def __init__(self):
+                self.stdout = io.BytesIO((result.stdout + result.stderr).encode("utf-8"))
+                self.returncode = result.returncode
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.stdout.close()
+
+            def wait(self):
+                return self.returncode
+
+        return ConversionProcess()
+
 
 class LauncherTests(unittest.TestCase):
     def setUp(self):
@@ -126,6 +148,7 @@ class LauncherTests(unittest.TestCase):
         if env is not None:
             environment.update(env)
         with patch.dict(os.environ, environment), patch.object(self.launcher.subprocess, "run", self.process), \
+                patch.object(self.launcher.subprocess, "Popen", self.process.popen), \
                 contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             if prompt is None:
                 status = self.launcher.main(arguments)

@@ -2,10 +2,12 @@
 
 import base64
 import json
+import logging
 import os
 import re
 from io import BytesIO
 from threading import Lock
+from time import monotonic
 from typing import get_args
 
 import openai
@@ -30,6 +32,7 @@ SEMANTIC_ERRORS = {
     "layout_rectangular_grid": "Table source cells must cover a rectangular grid",
     "layout_full_table_coverage": "Table cells must cover the entire table extent",
     "math_unsupported": "Required math is unresolved or unsupported",
+    "math_script_geometry": "Math script letters must agree with source baseline geometry",
     "table_cell_ownership": "Cell IDs must cover assigned cells once",
     "table_trusted_spans": "Trusted physical spans cannot change",
     "table_span_bounds": "Cell span exceeds table extent",
@@ -193,11 +196,14 @@ class CloudClient:
         self.cloud_max_images = int(config.get("cloud_max_images", 3))
         self.cloud_max_attempts = int(config.get("cloud_max_attempts", 3))
         self.cloud_max_requests = int(config.get("cloud_max_requests", 0))
+        self.cloud_max_concurrency = int(config.get("cloud_max_concurrency", 1))
         self.cloud_model = config.get("cloud_model", config.get("openai_model", "gemma4:31b"))
         self.cloud_base_url = config.get("cloud_base_url", config.get("openai_base_url", "https://ollama.com/v1"))
         self.timeout = config.get("cloud_timeout", config.get("timeout", 30))
         if self.cloud_max_attempts < 1 or self.cloud_max_requests < 0 or self.cloud_max_images < 0:
             raise ValueError("Cloud attempts must be positive; image/request limits must be nonnegative")
+        if not 1 <= self.cloud_max_concurrency <= 4:
+            raise ValueError("Cloud concurrency must be between one and four")
         self._client = client.with_options(max_retries=0) if client is not None else None
         self._lock = Lock()
         self.request_count = 0
@@ -218,6 +224,7 @@ class CloudClient:
             if self.cloud_max_requests and self.request_count >= self.cloud_max_requests:
                 raise RecognitionFailure("Document cloud request budget exhausted", attempts=attempts)
             self.request_count += 1
+            return self.request_count
 
     def request(
         self, prompt: str, images, schema: type[BaseModel], *, context_reflow=None
@@ -252,8 +259,12 @@ class CloudClient:
                 data = base64.b64encode(stream.getvalue()).decode("ascii")
                 content.append({"type": "image_url", "image_url": {"url": "data:image/png;base64," + data}})
             content.append({"type": "text", "text": current_prompt})
-            self._reserve_request(attempts)
+            request_number = self._reserve_request(attempts)
             attempts += 1
+            started = monotonic()
+            logging.getLogger("marker").info(
+                "Ollama request %d, attempt %d/%d", request_number, attempts, self.cloud_max_attempts
+            )
             try:
                 response = client.chat.completions.create(
                     model=self.cloud_model, messages=[{"role": "user", "content": content}],
@@ -265,7 +276,11 @@ class CloudClient:
                 if not response.choices:
                     raise ResponseValidationError("Response contains no completion")
                 choice = response.choices[0]
-                return validate_response(choice.message.content, schema, choice.finish_reason)
+                result = validate_response(choice.message.content, schema, choice.finish_reason)
+                logging.getLogger("marker").info(
+                    "Ollama request %d validated in %.1f s", request_number, monotonic() - started
+                )
+                return result
             except ResponseValidationError as error:
                 reason = str(error)
                 current_prompt = repair_prompt(original_prompt, reason)

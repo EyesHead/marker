@@ -1,5 +1,7 @@
 """Physical table discovery and bounded grouping before content recognition."""
 
+from collections import OrderedDict
+
 import json
 import re
 from html import escape
@@ -14,8 +16,11 @@ from marker.cloud.client import schema_prompt, semantic_error
 from marker.cloud.content import (
     MATH_CLASSIFICATION_PROMPT, ContentResult, atom_id, bounds, context_box,
     expression_groups, latex_to_mathml, resource_name, source_lines,
+    source_script_hints, validate_script_hints,
 )
 from marker.cloud.context import RecognitionFailure, fit_request
+from marker.cloud.math_evidence import with_math_closeups
+from marker.cloud.parallel import ordered_cloud_map
 from marker.cloud.regions import assess_text_quality, word_lines
 from marker.cloud.source import intersection
 from marker.processors.table_geometry import (
@@ -365,6 +370,15 @@ def _table_schema(expected, trusted, row_count, column_count):
                         if not part.atom_ids:
                             raise semantic_error("table_content_ownership")
                         owned = [atoms[identity] for identity in part.atom_ids]
+                        if part.kind == "math":
+                            identities = set(part.atom_ids)
+                            hints = [hint for hint in source_line.get("script_hints", [])
+                                     if hint["base_atom"] in identities
+                                     and identities.issuperset(hint["atom_ids"])]
+                            try:
+                                validate_script_hints(part.latex, hints)
+                            except RecognitionFailure:
+                                raise semantic_error("math_script_geometry") from None
                         if part.kind == "figure" and any(
                             a["kind"] not in ("image", "vector", "unknown")
                             for a in owned
@@ -396,6 +410,7 @@ def _describe_cells(grid, positions):
                 [atom_id(atom, page) for atom in group]
                 for group in expression_groups(atoms)
             ]
+            script_hints = source_script_hints(atoms)
             lines.append(
                 {
                     "id": f"{identity}l{number}",
@@ -404,6 +419,7 @@ def _describe_cells(grid, positions):
                     "layout_y": min(a.get("layout_bbox", a["bbox"])[1] for a in atoms),
                     "math_required": bool(groups),
                     "expression_groups": groups,
+                    **({"script_hints": script_hints} if script_hints else {}),
                     "atoms": [
                         {
                             "id": atom_id(atom, page),
@@ -453,7 +469,26 @@ def _window_prompt(cells, headers, trusted, rows, columns):
     )
 
 
-def _window_images(source, cells, originals, headers, maximum):
+def _window_images(source, cells, originals, headers, maximum, *, crop_cache=None):
+    def crop(page, box):
+        key = (page, tuple(box))
+        if crop_cache is not None and key in crop_cache:
+            image = crop_cache.pop(key)
+            crop_cache[key] = image
+            return image.copy()
+        image = source.crop(page, box)
+        # Repeated headers and candidate rectangles can share the render, but
+        # each returned image still belongs to its own request. Bound retained
+        # pixels as well as the number of entries for large source rectangles.
+        pixels = image.width * image.height
+        if crop_cache is not None and pixels <= 16_000_000:
+            while crop_cache and (len(crop_cache) >= 8 or pixels + sum(
+                item.width * item.height for item in crop_cache.values()
+            ) > 16_000_000):
+                crop_cache.popitem(last=False)
+            crop_cache[key] = image.copy()
+        return image
+
     boxes = {}
     for cell in cells:
         if cell["lines"]:
@@ -473,11 +508,11 @@ def _window_images(source, cells, originals, headers, maximum):
     images = []
     for page, source_boxes in sorted(boxes.items()):
         box = bounds([{"bbox": b} for b in source_boxes])
-        images.append(source.crop(page, context_box(source, page, box)))
+        images.append(crop(page, context_box(source, page, box)))
     # A header image is repeated context only when the image budget permits.
     if headers and len(images) < maximum and headers[0].get("page") is not None:
         images.append(
-            source.crop(
+            crop(
                 headers[0]["page"],
                 context_box(source, headers[0]["page"], headers[0]["bbox"]),
             )
@@ -493,8 +528,37 @@ def _owned_cells(units):
             key: cell[key] for key in ("id", "row", "column", "rowspan", "colspan")
         } | {"lines": []})
         if line is not None:
-            owned["lines"].append(line)
+            previous = next((item for item in owned["lines"] if item["id"] == line["id"]), None)
+            if previous is None:
+                owned["lines"].append(deepcopy(line))
+            else:
+                previous["atoms"].extend(deepcopy(line["atoms"]))
+                previous["bbox"] = bounds(previous["atoms"])
+                previous["expression_groups"].extend(deepcopy(line["expression_groups"]))
+                previous["math_required"] = bool(previous["expression_groups"])
+                if line.get("script_hints"):
+                    previous.setdefault("script_hints", []).extend(deepcopy(line["script_hints"]))
     return list(cells.values())
+
+
+def _line_fragments(line):
+    """Split an oversized baseline into source owners, keeping expressions whole."""
+    groups = {identity: group for group in line["expression_groups"] for identity in group}
+    seen, pieces = set(), []
+    for atom in line["atoms"]:
+        if atom["id"] in seen:
+            continue
+        identities = set(groups.get(atom["id"], [atom["id"]]))
+        owned = [item for item in line["atoms"] if item["id"] in identities]
+        seen.update(identities)
+        piece = {**line, "atoms": owned, "bbox": bounds(owned),
+                 "expression_groups": [group for group in line["expression_groups"] if identities.issuperset(group)]}
+        piece["math_required"] = bool(piece["expression_groups"])
+        if "script_hints" in line:
+            piece["script_hints"] = [hint for hint in line["script_hints"]
+                                     if hint["base_atom"] in identities and identities.issuperset(hint["atom_ids"])]
+        pieces.append(piece)
+    return pieces
 
 
 def _table_windows(source, described, originals, client, trusted, rows, columns):
@@ -536,24 +600,13 @@ def _table_windows(source, described, originals, client, trusted, rows, columns)
             }
         ]
     offset = 0
+    crop_cache = OrderedDict()
     while offset < len(units):
         selected = []
         best = None
         while offset + len(selected) < len(units):
             candidate = selected + [units[offset + len(selected)]]
-            cells_by_id = {}
-            for cell, line in candidate:
-                entry = cells_by_id.setdefault(
-                    cell["id"],
-                    {
-                        key: cell[key]
-                        for key in ("id", "row", "column", "rowspan", "colspan")
-                    }
-                    | {"lines": []},
-                )
-                if line is not None:
-                    entry["lines"].append(line)
-            cells = list(cells_by_id.values())
+            cells = _owned_cells(candidate)
             # Conservative JSON response reservation: IDs, spans and segment
             # fields cost more than source text alone. Math gets extra room.
             output_estimate = 128 + sum(
@@ -575,7 +628,8 @@ def _table_windows(source, described, originals, client, trusted, rows, columns)
             if len(pages) > client.cloud_max_images:
                 break
             images = _window_images(
-                source, cells, originals, context_headers, client.cloud_max_images
+                source, cells, originals, context_headers, client.cloud_max_images,
+                crop_cache=crop_cache,
             )
             if len(images) > client.cloud_max_images:
                 break
@@ -591,6 +645,11 @@ def _table_windows(source, described, originals, client, trusted, rows, columns)
             selected = candidate
             best = (cells, prompt, images, schema)
         if best is None:
+            cell, line = units[offset]
+            fragments = _line_fragments(line) if line is not None else []
+            if len(fragments) > 1:
+                units[offset:offset+1] = [(cell, fragment) for fragment in fragments]
+                continue
             raise RecognitionFailure(
                 "A required table line cannot fit the bounded request"
             )
@@ -735,9 +794,9 @@ def recognize_table(source, logical_table, client):
         rows, columns = len(ys) - 1, len(xs) - 1
         described, originals = _describe_cells(grid, positions)
         trusted = grid.get("trusted", True)
-        for cells, prompt, images, schema in _table_windows(
-            source, described, originals, client, trusted, rows, columns
-        ):
+        def request_window(window, source_call):
+            cells, prompt, images, schema = window
+            received = []
             # A server may enforce a smaller context than the conservative
             # client estimate. Keep reflowed ownership in the same counted
             # request; only successful disjoint remainders get a new request.
@@ -755,30 +814,57 @@ def recognize_table(source, logical_table, client):
                     reduced_cells = _owned_cells(units)
                     return (
                         _window_prompt(reduced_cells, [], trusted, rows, columns),
-                        _window_images(source, reduced_cells, originals, [], client.cloud_max_images),
+                        source_call(lambda: _window_images(source, reduced_cells, originals, [], client.cloud_max_images)),
                         _table_schema(reduced_cells, trusted, rows, columns),
                     )
 
                 result = client.request(prompt, images, schema, context_reflow=reflow)
-                for cell in result["cells"]:
-                    if cell["id"] in recognized:
-                        previous = recognized[cell["id"]]
-                        if any(
-                            previous[key] != cell[key]
-                            for key in ("row", "column", "rowspan", "colspan")
-                        ):
-                            raise RecognitionFailure(
-                                "Split cell structure changed between windows"
-                            )
-                        previous["lines"].extend(cell["lines"])
-                    else:
-                        recognized[cell["id"]] = cell
+                received.extend(result["cells"])
                 units = remaining
                 if units:
                     pending_cells = _owned_cells(units)
                     prompt = _window_prompt(pending_cells, [], trusted, rows, columns)
-                    images = _window_images(source, pending_cells, originals, [], client.cloud_max_images)
+                    images = source_call(lambda: _window_images(source, pending_cells, originals, [], client.cloud_max_images))
                     schema = _table_schema(pending_cells, trusted, rows, columns)
+            return received
+
+        def prepared_windows():
+            for cells, prompt, images, schema in _table_windows(
+                source, described, originals, client, trusted, rows, columns
+            ):
+                images = with_math_closeups(source, cells, images, client, prompt, schema)
+                yield cells, prompt, images, schema
+
+        # Finite request caps retain the original sequential reservation order.
+        workers = 1 if client.cloud_max_requests else getattr(client, "cloud_max_concurrency", 1)
+        for received in ordered_cloud_map(request_window, prepared_windows(), workers):
+            for cell in received:
+                if cell["id"] in recognized:
+                    previous = recognized[cell["id"]]
+                    if any(
+                        previous[key] != cell[key]
+                        for key in ("row", "column", "rowspan", "colspan")
+                    ):
+                        raise RecognitionFailure(
+                            "Split cell structure changed between windows"
+                        )
+                    for line in cell["lines"]:
+                        earlier = next((item for item in previous["lines"] if item["id"] == line["id"]), None)
+                        if earlier is None:
+                            previous["lines"].append(line)
+                        else:
+                            earlier["parts"].extend(line["parts"])
+                else:
+                    recognized[cell["id"]] = cell
+        # Fragments keep their original baseline ID; reassemble source order.
+        for original in described:
+            for line in recognized[original["id"]]["lines"]:
+                expected = next(item for item in original["lines"] if item["id"] == line["id"])
+                order = {atom["id"]: index for index, atom in enumerate(expected["atoms"])}
+                line["parts"].sort(key=lambda part: min(order[identity] for identity in part["atom_ids"]))
+                identities = [identity for part in line["parts"] for identity in part["atom_ids"]]
+                if len(identities) != len(order) or set(identities) != set(order):
+                    raise RecognitionFailure("Reassembled baseline must own every source atom once")
         _validate_final_structure(recognized, rows, columns)
         html = _render_recognized_table(
             source, described, originals, recognized, resources, grid

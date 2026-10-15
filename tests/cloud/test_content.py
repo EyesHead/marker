@@ -122,10 +122,11 @@ def table_echo(source, _):
             atoms = line["atoms"]
             parts = []
             if line["math_required"]:
+                source_text = "".join(atom.get("text", "") for atom in atoms)
                 parts.append(
                     {
                         "kind": "math",
-                        "latex": r"x \geq 0",
+                        "latex": {"α1": r"\alpha_1", "α2": r"\alpha_2"}.get(source_text, r"x \geq 0"),
                         "atom_ids": [a["id"] for a in atoms],
                     }
                 )

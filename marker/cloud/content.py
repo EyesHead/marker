@@ -3,7 +3,9 @@
 import hashlib
 import json
 import re
+import unicodedata
 from dataclasses import dataclass, field
+from functools import lru_cache
 from html import escape
 from typing import Literal
 from xml.etree import ElementTree as ET
@@ -23,6 +25,13 @@ MATH_CLASSIFICATION_PROMPT = (
     "even without an equals sign or operator. Classify it as math, including when stored as raster pixels. "
     "When transcribing math, always return exact LaTeX. Reserve figure for actual diagrams, photos, and plots; "
     "raster storage alone never makes mathematical content a figure. "
+    "Read the main baseline and every subscript/superscript before writing LaTeX. "
+    "Keep ALL lowered letters in one braced index on their actual base: "
+    r"for a source R with lowered bun, write R_{bun} or R_{\text{bun}}, never Rb_{un}. "
+    "Do not move any letter between a baseline and an index, split a multi-letter index, "
+    "or invent an index from a familiar formula. Check against the pixels, not conventions. "
+    "Return LaTeX only in the latex field; visible MathML is generated from that same string by code. "
+    "Labels on close-up sheets are source atom IDs, never mathematical content. "
 )
 
 
@@ -315,6 +324,7 @@ def group_expression_regions(regions):
     )
 
 
+@lru_cache(maxsize=512)
 def latex_to_mathml(latex, *, display="inline"):
     """Typeset real MathML, retaining exact recognized LaTeX for inspection."""
     from latex2mathml.converter import convert
@@ -328,6 +338,12 @@ def latex_to_mathml(latex, *, display="inline"):
         # Unknown commands may be emitted as literal text instead of raising.
         if any("\\" in (node.text or "") for node in root.iter()):
             raise ValueError("unsupported command")
+        arity = {"msub": 2, "msup": 2, "msubsup": 3, "mfrac": 2,
+                 "mroot": 2, "munder": 2, "mover": 2, "munderover": 3}
+        for node in root.iter():
+            tag = node.tag.rsplit("}", 1)[-1]
+            if tag in arity and len(node) != arity[tag]:
+                raise ValueError("invalid mathematical tree")
         semantics = ET.Element(f"{{{MATH_NAMESPACE}}}semantics")
         for child in list(root):
             root.remove(child)
@@ -344,6 +360,117 @@ def latex_to_mathml(latex, *, display="inline"):
         raise RecognitionFailure(
             "Required LaTeX could not be rendered as MathML"
         ) from None
+
+
+def source_script_hints(atoms):
+    """Conservative script evidence from selectable text, never from raster size.
+
+    Only a clearly smaller word beside a simple mathematical base qualifies.
+    These are constraints for validation, not guessed replacement formulae.
+    """
+    words = sorted((a for a in atoms if a.get("kind", "text") == "text"),
+                   key=lambda a: a["bbox"][0])
+    hints = []
+    for index, word in enumerate(words):
+        value = word.get("text", "")
+        if not re.fullmatch(r"[A-Za-zА-Яа-яα-ωΑ-Ωϕϑϱ0-9]+", value):
+            continue
+        size = word.get("size", word["bbox"][3] - word["bbox"][1])
+        previous = words[index - 1] if index else None
+        if (hints and previous is not None and atom_id(previous) in hints[-1]["atom_ids"]
+                and word.get("source_page", 0) == previous.get("source_page", 0)
+                and abs(size - previous.get("size", previous["bbox"][3] - previous["bbox"][1])) <= size * 0.15
+                and 0 <= word["bbox"][0] - previous["bbox"][2] <= size * 0.5
+                and abs(word["bbox"][1] - previous["bbox"][1]) <= size * 0.2):
+            hints[-1]["text"] += value
+            hints[-1]["atom_ids"].append(atom_id(word))
+            continue
+        for base in reversed(words[:index]):
+            base_text = base.get("text", "")
+            base_size = base.get("size", base["bbox"][3] - base["bbox"][1])
+            if (not re.fullmatch(r"(?:[0-9]+(?:[.,][0-9]+)?)?[A-Za-zА-Яа-яα-ωΑ-Ωϕϑϱ]{1,3}", base_text)
+                    or size <= 0 or base_size < size * 1.3
+                    or base.get("source_page", 0) != word.get("source_page", 0)):
+                continue
+            x0, top, x1, bottom = base["bbox"]
+            box = word["bbox"]
+            # Avoid classifying distant annotation prose as a script.
+            if not -0.1 * base_size <= box[0] - x1 <= base_size * 0.75:
+                continue
+            height = bottom - top
+            if box[1] >= top + height * 0.35 and box[3] >= bottom - base_size * 0.15:
+                position = "subscript"
+            elif box[3] <= top + height * 0.65 and box[1] < top + height * 0.25:
+                position = "superscript"
+            else:
+                continue
+            identity = atom_id(base)
+            if (hints and hints[-1]["base_atom"] == identity
+                    and hints[-1]["position"] == position
+                    and box[0] - words[index - 1]["bbox"][2] <= size):
+                hints[-1]["text"] += value
+                hints[-1]["atom_ids"].append(atom_id(word))
+            else:
+                hints.append({"base_atom": identity, "base": base_text[-1],
+                              "position": position, "text": value,
+                              "atom_ids": [atom_id(word)]})
+            break
+    # Stacked letters beside a base can be either a fraction or two scripts.
+    # Text boxes alone do not distinguish them; leave that case to the pixels.
+    lookup = {atom_id(word): word for word in words}
+    ambiguous = set()
+    for first in hints:
+        for second in hints:
+            if first["base_atom"] != second["base_atom"] or first["position"] == second["position"]:
+                continue
+            a = bounds([lookup[identity] for identity in first["atom_ids"]])
+            b = bounds([lookup[identity] for identity in second["atom_ids"]])
+            overlap = min(a[2], b[2]) - max(a[0], b[0])
+            if overlap >= min(a[2]-a[0], b[2]-b[0]) * 0.5:
+                ambiguous.add(first["base_atom"])
+    return [hint for hint in hints if hint["base_atom"] not in ambiguous]
+
+
+def validate_script_hints(latex, hints):
+    """Reject a response that moves known source script letters to the baseline."""
+    if not hints:
+        return
+    root = ET.fromstring(latex_to_mathml(latex))
+    def baseline_text(node):
+        tag = node.tag.rsplit("}", 1)[-1]
+        if tag in ("msub", "msup", "msubsup", "mover", "munder", "munderover"):
+            return baseline_text(node[0])
+        value = "".join(baseline_text(child) for child in node) if len(node) else node.text or ""
+        # Compare styled mathematical letters to their source spelling only;
+        # never normalize stored LaTeX or collapse phi/varphi distinctions.
+        symbols = {"PHI": "ϕ", "THETA": "ϑ", "RHO": "ϱ", "EPSILON": "ϵ", "PI": "ϖ", "KAPPA": "ϰ"}
+        plain = []
+        for character in value:
+            if 0x1D400 <= ord(character) <= 0x1D7FF or 0x2100 <= ord(character) <= 0x214F:
+                name = unicodedata.name(character, "")
+                symbol = next((glyph for key, glyph in symbols.items() if name.endswith(key + " SYMBOL")), None)
+                plain.append(symbol or unicodedata.normalize("NFKC", character))
+            else:
+                plain.append(character)
+        return "".join(plain).strip()
+    observed = []
+    for node in root.iter():
+        tag = node.tag.rsplit("}", 1)[-1]
+        for position, offset in (("subscript", 1), ("superscript", 2 if tag == "msubsup" else 1)):
+            if tag not in (("msub", "msubsup") if position == "subscript" else ("msup", "msubsup")):
+                continue
+            # A combined sub/superscript still has the same mathematical base.
+            base_node = node[0]
+            while base_node.tag.rsplit("}", 1)[-1] in ("msub", "msup", "msubsup"):
+                base_node = base_node[0]
+            base = baseline_text(base_node)
+            script = re.sub(r"\s", "", baseline_text(node[offset]))
+            observed.append((position, base, script))
+    for hint in hints:
+        key = (hint["position"], hint["base"], hint["text"])
+        if key not in observed:
+            raise RecognitionFailure("Recognized script disagrees with source baseline geometry")
+        observed.remove(key)
 
 
 def resource_name(kind, page, box, suffix=""):
@@ -431,6 +558,7 @@ def recognize_region(source, region, client, *, allow_text=True):
             "bbox": region.bbox,
             "required_kind": region.kind,
             "allow_text": allow_text,
+            "script_hints": source_script_hints(region.atoms),
             "atoms": [
                 {
                     "id": atom_id(a, region.page),
@@ -463,6 +591,11 @@ def recognize_region(source, region, client, *, allow_text=True):
                     raise semantic_error("content_ocr_disabled")
                 if region.kind == "math" and self.kind != "math":
                     raise semantic_error("content_expression_kind")
+                if self.kind == "math":
+                    try:
+                        validate_script_hints(self.latex, payload["script_hints"])
+                    except RecognitionFailure:
+                        raise semantic_error("math_script_geometry") from None
                 return self
 
         response = client.request(
