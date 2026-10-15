@@ -601,6 +601,386 @@ class ContentTests(unittest.TestCase):
                 "Value 6", BeautifulSoup(result.html, "html.parser").get_text()
             )
 
+    def test_table_isolated_operator_response_is_repaired_to_whole_expression(self):
+        self.content()
+        from marker.cloud.tables import recognize_table
+
+        rejected = []
+
+        def response(s, n):
+            result = table_echo(s, n)
+            for cell in result["cells"]:
+                assigned = next(c for c in s["cells"] if c["id"] == cell["id"])
+                for line in cell["lines"]:
+                    owned = next(l for l in assigned["lines"] if l["id"] == line["id"])
+                    if not owned["math_required"]:
+                        continue
+                    if not rejected:
+                        rejected.append(True)
+                        line["parts"] = [
+                            (
+                                {
+                                    "kind": "math",
+                                    "latex": r"\geq",
+                                    "atom_ids": [a["id"]],
+                                }
+                                if a["kind"] == "image"
+                                else {
+                                    "kind": "text",
+                                    "text": a["text"],
+                                    "atom_ids": [a["id"]],
+                                }
+                            )
+                            for a in owned["atoms"]
+                        ]
+            return result
+
+        with PdfSource(FIXTURES / "split_formula.pdf") as source:
+            client, observed = offline_client(response, {"cloud_max_attempts": 2})
+            result = recognize_table(
+                source, group_tables(detect_tables(source), None)[0], client
+            )
+            self.assertTrue(result.complete, result.reasons)
+            annotation = BeautifulSoup(result.html, "html.parser").find("annotation")
+            self.assertEqual(annotation.text, r"x \geq 0")
+            math_requests = [
+                window
+                for window in observed
+                if any(l["math_required"] for c in window["cells"] for l in c["lines"])
+            ]
+            self.assertEqual(
+                len(math_requests),
+                2,
+                "Isolated operator must require a counted schema repair",
+            )
+            audits = [
+                image
+                for name, image in result.resources.items()
+                if name.startswith("formula")
+            ]
+            self.assertEqual(len(audits), 1)
+            self.assertGreater(
+                audits[0].width,
+                300,
+                "Audit must cover selectable x and 0 plus raster operator",
+            )
+
+    def test_table_isolated_operator_cannot_exhaust_repairs_and_report_complete(self):
+        self.content()
+        from marker.cloud.tables import recognize_table
+
+        def response(s, n):
+            result = table_echo(s, n)
+            for cell in result["cells"]:
+                assigned = next(c for c in s["cells"] if c["id"] == cell["id"])
+                for line in cell["lines"]:
+                    owned = next(l for l in assigned["lines"] if l["id"] == line["id"])
+                    if owned["math_required"]:
+                        line["parts"] = [
+                            (
+                                {
+                                    "kind": "math",
+                                    "latex": r"\geq",
+                                    "atom_ids": [a["id"]],
+                                }
+                                if a["kind"] == "image"
+                                else {
+                                    "kind": "text",
+                                    "text": a["text"],
+                                    "atom_ids": [a["id"]],
+                                }
+                            )
+                            for a in owned["atoms"]
+                        ]
+            return result
+
+        with PdfSource(FIXTURES / "split_formula.pdf") as source:
+            client, observed = offline_client(response, {"cloud_max_attempts": 2})
+            result = recognize_table(
+                source, group_tables(detect_tables(source), None)[0], client
+            )
+            self.assertFalse(result.complete)
+            self.assertTrue(result.reasons)
+            self.assertTrue(result.resources)
+            self.assertEqual(
+                len(
+                    [
+                        w
+                        for w in observed
+                        if any(
+                            l["math_required"] for c in w["cells"] for l in c["lines"]
+                        )
+                    ]
+                ),
+                2,
+            )
+
+    def test_mixed_prose_keeps_only_complete_expression_under_math_ownership(self):
+        self.content()
+        from marker.cloud.tables import LogicalTable, TablePart, recognize_table
+
+        with PdfSource(FIXTURES / "split_formula.pdf") as source:
+            bbox = (30, 40, 112, 56)
+            atoms = source.page_words(0, bbox)
+            image = next(
+                image
+                for image in source.page_images(0)
+                if image.bbox == (85, 40, 101, 56)
+            )
+            atoms.append(
+                {
+                    "kind": "image",
+                    "bbox": image.bbox,
+                    "source_bbox": image.bbox,
+                    "source_page": 0,
+                    "image_index": image.index,
+                }
+            )
+            grid = {
+                "page": 0,
+                "bbox": bbox,
+                "cells": [
+                    {
+                        "bbox": bbox,
+                        "source_bbox": bbox,
+                        "source_page": 0,
+                        "atoms": atoms,
+                    }
+                ],
+                "trusted": False,
+            }
+            table = LogicalTable(
+                [TablePart(0, bbox, grid, source.page_size(0), source=source)], grid
+            )
+
+            def response(s, n):
+                cell = s["cells"][0]
+                line = cell["lines"][0]
+                label = next(a for a in line["atoms"] if a["text"] == "Limit:")
+                expression = [a["id"] for a in line["atoms"] if a["id"] != label["id"]]
+                self.assertEqual(line["expression_groups"], [expression])
+                return {
+                    "cells": [
+                        {
+                            key: cell[key]
+                            for key in ("id", "row", "column", "rowspan", "colspan")
+                        }
+                        | {
+                            "lines": [
+                                {
+                                    "id": line["id"],
+                                    "parts": [
+                                        {
+                                            "kind": "text",
+                                            "text": "Limit:",
+                                            "atom_ids": [label["id"]],
+                                        },
+                                        {
+                                            "kind": "math",
+                                            "latex": r"x \geq 0",
+                                            "atom_ids": expression,
+                                        },
+                                    ],
+                                }
+                            ]
+                        }
+                    ]
+                }
+
+            client, _ = offline_client(response)
+            result = recognize_table(source, table, client)
+            self.assertTrue(result.complete, result.reasons)
+            soup = BeautifulSoup(result.html, "html.parser")
+            self.assertEqual(soup.find("annotation").text, r"x \geq 0")
+            self.assertIn("Limit:", soup.find("td").get_text())
+            self.assertNotIn("Limit", soup.find("annotation").text)
+
+    def test_expression_groups_keep_subscripts_and_independent_expressions(self):
+        from marker.cloud.content import expression_groups
+
+        atoms = [
+            {"kind": "text", "text": "For", "bbox": (0, 0, 14, 10), "size": 10},
+            {"kind": "text", "text": "x", "bbox": (17, 0, 22, 10), "size": 10},
+            {"kind": "text", "text": "2", "bbox": (23, -2, 27, 4), "size": 6},
+            {"kind": "text", "text": "≥", "bbox": (30, 0, 38, 10), "size": 10},
+            {"kind": "text", "text": "0", "bbox": (40, 0, 46, 10), "size": 10},
+            {"kind": "text", "text": "and", "bbox": (49, 0, 66, 10), "size": 10},
+            {"kind": "text", "text": "α", "bbox": (69, 0, 76, 10), "size": 10},
+            {"kind": "text", "text": "1", "bbox": (77, 6, 81, 12), "size": 6},
+            {"kind": "text", "text": "=", "bbox": (84, 0, 92, 10), "size": 10},
+            {"kind": "text", "text": "1,5", "bbox": (94, 0, 111, 10), "size": 10},
+        ]
+        groups = expression_groups(atoms)
+        self.assertEqual(
+            [[atom["text"] for atom in group] for group in groups],
+            [["x", "2", "≥", "0"], ["α", "1", "=", "1,5"]],
+        )
+        spaced = deepcopy(atoms[1:5] + atoms[6:])
+        for atom in spaced[4:]:
+            box = atom["bbox"]
+            atom["bbox"] = (box[0] + 40, box[1], box[2] + 40, box[3])
+        self.assertEqual(
+            [[a["text"] for a in g] for g in expression_groups(spaced)],
+            [["x", "2", "≥", "0"], ["α", "1", "=", "1,5"]],
+        )
+
+    def test_table_subscript_split_requires_counted_complete_expression_repair(self):
+        self.content()
+        from marker.cloud.tables import recognize_table
+
+        rejected = []
+        target = []
+
+        def response(s, n):
+            result = table_echo(s, n)
+            for cell in result["cells"]:
+                assigned = next(c for c in s["cells"] if c["id"] == cell["id"])
+                if cell["column"] != 0 or cell["row"] != 1:
+                    continue
+                for line in cell["lines"]:
+                    owned = next(l for l in assigned["lines"] if l["id"] == line["id"])
+                    text = "".join(a["text"] for a in owned["atoms"])
+                    latex = {"α1": r"\alpha_1", "α2": r"\alpha_2", "β": r"\beta"}[text]
+                    line["parts"] = [
+                        {
+                            "kind": "math",
+                            "latex": latex,
+                            "atom_ids": [a["id"] for a in owned["atoms"]],
+                        }
+                    ]
+                    if text == "α1" and not rejected:
+                        target.append(line["id"])
+                        rejected.append(True)
+                        alpha = next(a for a in owned["atoms"] if a["text"] == "α")
+                        subscript = next(a for a in owned["atoms"] if a["text"] == "1")
+                        line["parts"] = [
+                            {
+                                "kind": "math",
+                                "latex": r"\alpha",
+                                "atom_ids": [alpha["id"]],
+                            },
+                            {
+                                "kind": "text",
+                                "text": "1",
+                                "atom_ids": [subscript["id"]],
+                            },
+                        ]
+            return result
+
+        with PdfSource(FIXTURES / "content_lines.pdf") as source:
+            client, observed = offline_client(response, {"cloud_max_attempts": 2})
+            result = recognize_table(
+                source, group_tables(detect_tables(source), None)[0], client
+            )
+            self.assertTrue(result.complete, result.reasons)
+            soup = BeautifulSoup(result.html, "html.parser")
+            self.assertEqual(
+                [a.text for a in soup.find_all("annotation")],
+                [r"\alpha_1", r"\alpha_2", r"\beta"],
+            )
+            self.assertEqual(
+                len(
+                    [
+                        w
+                        for w in observed
+                        if any(
+                            l["id"] == target[0] for c in w["cells"] for l in c["lines"]
+                        )
+                    ]
+                ),
+                2,
+            )
+            audits = [
+                image
+                for name, image in result.resources.items()
+                if name.startswith("formula")
+            ]
+            self.assertGreater(
+                audits[0].width,
+                90,
+                "Complete alpha1 crop must retain lowered subscript ink",
+            )
+
+    def test_two_independent_expression_owners_preserve_prose_in_counted_schema(self):
+        from marker.cloud.content import atom_id, expression_groups
+        from marker.cloud.tables import _table_schema
+
+        atoms = [
+            {"kind": "text", "text": text, "bbox": box, "size": 10}
+            for text, box in [
+                ("For", (0, 0, 14, 10)),
+                ("x", (17, 0, 22, 10)),
+                ("≥", (24, 0, 32, 10)),
+                ("0", (34, 0, 40, 10)),
+                ("and", (43, 0, 60, 10)),
+                ("α", (63, 0, 70, 10)),
+                ("=", (72, 0, 80, 10)),
+                ("1,5", (82, 0, 99, 10)),
+            ]
+        ]
+        described = [dict(atom, id=atom_id(atom, 0)) for atom in atoms]
+        groups = [[atom_id(a, 0) for a in group] for group in expression_groups(atoms)]
+        line = {
+            "id": "line",
+            "atoms": described,
+            "expression_groups": groups,
+            "math_required": True,
+        }
+        cell = {
+            "id": "cell",
+            "row": 0,
+            "column": 0,
+            "rowspan": 1,
+            "colspan": 1,
+            "lines": [line],
+        }
+        schema = _table_schema([cell], True, 1, 1)
+        parts = [
+            {"kind": "text", "text": "For", "atom_ids": [described[0]["id"]]},
+            {"kind": "math", "latex": r"x \geq 0", "atom_ids": groups[0]},
+            {"kind": "text", "text": "and", "atom_ids": [described[4]["id"]]},
+            {"kind": "math", "latex": r"\alpha=1{,}5", "atom_ids": groups[1]},
+        ]
+        response = {
+            "cells": [
+                {
+                    key: cell[key]
+                    for key in ("id", "row", "column", "rowspan", "colspan")
+                }
+                | {"lines": [{"id": "line", "parts": parts}]}
+            ]
+        }
+        pixel = Image.new("RGB", (100, 20), "black")
+
+        def respond(s, n):
+            if n == 1:
+                collapsed = deepcopy(response)
+                collapsed["cells"][0]["lines"][0]["parts"] = [
+                    {
+                        "kind": "math",
+                        "latex": r"x \geq 0 \quad \alpha=1{,}5",
+                        "atom_ids": [a["id"] for a in described],
+                    }
+                ]
+                return collapsed
+            return response
+
+        client, _ = offline_client(respond, {"cloud_max_attempts": 2})
+        actual = client.request(
+            "Recognize assigned expressions. SOURCE:\n" + json.dumps({"cells": [cell]}),
+            [pixel],
+            schema,
+        )
+        self.assertEqual(
+            [part["kind"] for part in actual["cells"][0]["lines"][0]["parts"]],
+            ["text", "math", "text", "math"],
+        )
+        self.assertEqual(
+            client.request_count,
+            2,
+            "Combining independent expressions and prose must require repair",
+        )
+
     def test_png_output_preserves_alpha(self):
         pixels = Image.new("RGBA", (3, 2), (10, 20, 30, 0))
         pixels.putpixel((1, 1), (40, 50, 60, 127))

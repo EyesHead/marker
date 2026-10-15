@@ -119,6 +119,61 @@ def math_required(atoms):
     )
 
 
+def expression_groups(atoms):
+    """Identify complete mathematical glyph runs within one source baseline.
+
+    Prose, separating punctuation and wide source gaps delimit expressions.
+    Digits/ordinary variable glyphs belong to a neighboring math seed even
+    though they are not independently sufficient to require transcription.
+    """
+    baseline_size = max(
+        (
+            a.get("size", a["bbox"][3] - a["bbox"][1])
+            for a in atoms
+            if a.get("kind", "text") == "text"
+        ),
+        default=10,
+    )
+
+    def member(atom):
+        if atom.get("kind") == "image":
+            box = atom["bbox"]
+            return box[2] - box[0] <= 24 and box[3] - box[1] <= 24
+        if atom.get("kind", "text") != "text":
+            return False
+        text = atom.get("text", "").strip()
+        if not text or text in (",", ";", ":"):
+            return False
+        if re.search(r"[=<>≤≥≠±∑∏∫√∞∂α-ωΑ-Ωϕϑϱ]|\\[A-Za-z]+", text):
+            return True
+        if re.fullmatch(r"[+−*/^_()\[\]{}-]+", text):
+            return True
+        if re.fullmatch(r"[+-]?\d+(?:[.,]\d+)*[,;]?", text):
+            return True
+        if re.fullmatch(r"[A-Za-zА-Яа-я]", text):
+            return True
+        if re.fullmatch(r"[A-Za-zА-Яа-я0-9]+", text):
+            size = atom.get("size", atom["bbox"][3] - atom["bbox"][1])
+            return size < baseline_size * 0.8 or (atom.get("italic") and len(text) <= 4)
+        return False
+
+    runs = []
+    current = []
+    for atom in sorted(atoms, key=lambda a: a["bbox"][0]):
+        if not member(atom):
+            if current:
+                runs.append(current)
+                current = []
+            continue
+        if current and atom["bbox"][0] - current[-1]["bbox"][2] > 16:
+            runs.append(current)
+            current = []
+        current.append(atom)
+    if current:
+        runs.append(current)
+    return [run for run in runs if math_required(run)]
+
+
 def group_expression_regions(regions):
     """Partition non-table source atoms into complete expressions once.
 
