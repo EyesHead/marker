@@ -76,9 +76,11 @@ jobs:
     steps:
       - name: Prepare Ubuntu 25.10
         run: |
-          # Ubuntu 25.10 is archived; use its matching release packages.
-          sed -i -E 's#https?://(archive|security).ubuntu.com/ubuntu/?#http://old-releases.ubuntu.com/ubuntu/#g' /etc/apt/sources.list.d/ubuntu.sources
-          apt-get update
+          # Use the image's release mirrors, falling back when it is archived.
+          if ! apt-get update; then
+            sed -i -E 's#https?://(archive|security).ubuntu.com/ubuntu/?#http://old-releases.ubuntu.com/ubuntu/#g' /etc/apt/sources.list.d/ubuntu.sources
+            apt-get update
+          fi
           apt-get install -y ca-certificates curl git
           cat /etc/os-release
       - uses: actions/checkout@v4
