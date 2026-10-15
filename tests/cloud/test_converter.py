@@ -314,6 +314,36 @@ class AdaptiveConverterTests(unittest.TestCase):
         self.assertEqual(len(vectors), 2)
         self.assertTrue(all(a["bbox"][1] == a["bbox"][3] for a in vectors))
 
+    def test_returned_resources_are_lossless_lazy_png_after_source_closes(self):
+        from PIL import Image, PngImagePlugin
+        from marker.cloud.source import PdfSource
+        from marker.output import save_output
+
+        with PdfSource(FIXTURES / "native_figure.pdf") as source:
+            original = source.extract_image(source.page_images(0)[0])
+            expected = original.tobytes()
+        output, _ = self.convert("native_figure.pdf")
+        self.assertTrue(output.images)
+        for image in output.images.values():
+            self.assertIsInstance(image, PngImagePlugin.PngImageFile)
+            self.assertTrue(image.tile)
+        with tempfile.TemporaryDirectory() as directory:
+            # Final publication must not bring all retained pixel buffers back
+            # into memory. The original PDF has already closed here.
+            from contextlib import ExitStack
+            with ExitStack() as stack:
+                for image in output.images.values():
+                    stack.enter_context(patch.object(
+                        image, "load", side_effect=AssertionError("decoded retained PNG")
+                    ))
+                save_output(output, directory, "Native")
+            native_name = next(name for name, image in output.images.items()
+                               if image.size == (2048, 1024))
+            with Image.open(Path(directory) / native_name) as saved:
+                self.assertEqual(saved.tobytes(), expected)
+        native = output.images[native_name]
+        self.assertEqual(native.copy().tobytes(), expected)
+
     def test_symbol_versus_figure_rule_reaches_every_recognition_stage(self):
         from marker.converters.ollama import OllamaPdfConverter
 

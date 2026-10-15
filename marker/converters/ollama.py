@@ -21,6 +21,7 @@ from marker.cloud.content import (
 )
 from marker.cloud.context import RecognitionFailure
 from marker.cloud.regions import Region, analyze_page, assess_text_quality
+from marker.cloud.resources import retain_png
 from marker.cloud.source import PdfSource, intersection
 from marker.cloud.tables import TablePart, detect_tables, group_tables, recognize_table
 from marker.converters import BaseConverter
@@ -121,7 +122,10 @@ def scan_layout(source, region, client):
         "inside each cell. Do not combine multiple baselines into one bitmap. Non-table cells=[]. "
         "Classify formulas as math even when OCR is disabled. "
         + MATH_CLASSIFICATION_PROMPT
-        + "Decoration must be explicitly classified. "
+        + "In this layout stage each baseline has only bbox and kind; do not return text, latex, "
+        "HTML or transcription fields. If the whole crop is one formula, figure or paragraph, "
+        "copy SOURCE.bbox exactly for that region. Subregions must stay within SOURCE.bbox. "
+        "Decoration must be explicitly classified. "
         "Set complete=false for any unreadable, missing or uncertain layout.\nSOURCE:\n"
         + json.dumps({"stage": "layout", "page": region.page, "bbox": region.bbox})
     )
@@ -316,6 +320,19 @@ class OllamaPdfConverter(BaseConverter):
 
     def __call__(self, filepath):
         reasons, images, outputs, regions = [], {}, [], []
+
+        def retain_result(result):
+            # Release decoded resources as each region finishes, while the
+            # remaining document is processed. PNG compression is lossless.
+            result.resources = {
+                name: retain_png(image) for name, image in result.resources.items()
+            }
+            return result
+
+        def append_output(item):
+            retain_result(item[3])
+            outputs.append(item)
+
         start_requests = self.client.request_count
         with PdfSource(filepath, crop_dpi=self.cloud_crop_dpi) as source:
             pages = list(
@@ -342,7 +359,7 @@ class OllamaPdfConverter(BaseConverter):
                         page, box, "unknown", (), assess_text_quality([], box)
                     )
                     result = self._unresolved(source, region, error.reason)
-                    outputs.append((page, 0.0, 0.0, result))
+                    append_output((page, 0.0, 0.0, result))
                     continue
                 for region in page_regions:
                     if region.kind != "image":
@@ -354,7 +371,7 @@ class OllamaPdfConverter(BaseConverter):
                         regions.extend(scan_layout(source, region, self.client))
                     except RecognitionFailure as error:
                         result = self._unresolved(source, region, error.reason)
-                        outputs.append((page, region.bbox[1], region.bbox[0], result))
+                        append_output((page, region.bbox[1], region.bbox[0], result))
             parts = [
                 native_parts.get((r.page, r.bbox))
                 or TablePart(
@@ -382,7 +399,7 @@ class OllamaPdfConverter(BaseConverter):
                         result = self._unresolved(
                             source, region, "Required table text OCR is disabled"
                         )
-                        outputs.append(
+                        append_output(
                             (region.page, region.bbox[1], region.bbox[0], result)
                         )
                         candidates = [
@@ -408,7 +425,7 @@ class OllamaPdfConverter(BaseConverter):
                         )
                         for math_region in group_expression_regions(candidates):
                             if math_region.kind == "math":
-                                outputs.append(
+                                append_output(
                                     (
                                         region.page,
                                         math_region.bbox[1],
@@ -433,7 +450,7 @@ class OllamaPdfConverter(BaseConverter):
                             ):
                                 atom["kind"], atom["text"] = "unknown", ""
                 result = recognize_table(source, table, self.client)
-                outputs.append((part.page, part.bbox[1], part.bbox[0], result))
+                append_output((part.page, part.bbox[1], part.bbox[0], result))
             inline_results = {}
             content_regions = group_expression_regions(
                 [r for r in regions if r.kind != "table"]
@@ -443,10 +460,10 @@ class OllamaPdfConverter(BaseConverter):
                             region_number, len(content_regions), self.client.request_count)
                 if region.inline_group:
                     inline_results.setdefault(region.inline_group, []).append(
-                        (region.bbox[0], self._recognize(source, region))
+                        (region.bbox[0], retain_result(self._recognize(source, region)))
                     )
                     continue
-                outputs.append(
+                append_output(
                     (
                         region.page,
                         region.bbox[1],
@@ -472,7 +489,7 @@ class OllamaPdfConverter(BaseConverter):
                         identity for r in results for identity in r.source_atom_ids
                     ),
                 )
-                outputs.append((page, box[1], box[0], result))
+                append_output((page, box[1], box[0], result))
         markdown = []
         for page, _, _, result in sorted(outputs, key=lambda item: item[:3]):
             if result.markdown:

@@ -14,7 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from marker.cloud.client import schema_prompt, semantic_error
 from marker.cloud.content import (
-    MATH_CLASSIFICATION_PROMPT, ContentResult, atom_id, bounds, context_box,
+    MATH_CLASSIFICATION_PROMPT, MATH_TRANSCRIPTION_PROMPT, ContentResult, atom_id, bounds, context_box,
     expression_groups, latex_to_mathml, resource_name, source_lines,
     source_script_hints, validate_script_hints,
 )
@@ -227,7 +227,8 @@ def _visual_decision(first, second, client):
     images = [part.source.crop(part.page, part.bbox, dpi=144) for part in (first, second)]
     prompt = ("Decide whether these two source crops continue ONE logical table across a page break. "
               "Use captions, column alignment, headings and row meaning. Identical column counts alone "
-              "are insufficient. Return merge=true only with positive continuation evidence.\n"
+              'are insufficient. Return merge=true only with positive continuation evidence. '
+              'Return only {"merge":true} or {"merge":false}. Do not reconstruct or transcribe the tables here.\n'
               "First: " + _summary(first) + "\nSecond: " + _summary(second))
     return client.request(prompt, images, ContinuationDecision)["merge"]
 
@@ -460,7 +461,7 @@ def _window_prompt(cells, headers, trusted, rows, columns):
         "a merged cell may contain multiple expressions. Retain trusted spans exactly. If trusted=false, "
         "reconstruct row/column spans within the table dimensions without overlap, retaining source cell/line IDs. "
         "Use math with exact LaTeX for complete expressions, figure for diagrams, text for ordinary words. "
-        + MATH_CLASSIFICATION_PROMPT
+        + MATH_CLASSIFICATION_PROMPT + MATH_TRANSCRIPTION_PROMPT
         + "Each expression_groups entry must be owned in full by one math part; keep surrounding prose "
         "and independent expressions in separate parts. Never transcribe a required operator alone. "
         "Preserve phi/varphi, Cyrillic/Latin subscripts, decimal commas and superscripts. "

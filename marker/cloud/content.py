@@ -25,6 +25,8 @@ MATH_CLASSIFICATION_PROMPT = (
     "even without an equals sign or operator. Classify it as math, including when stored as raster pixels. "
     "When transcribing math, always return exact LaTeX. Reserve figure for actual diagrams, photos, and plots; "
     "raster storage alone never makes mathematical content a figure. "
+)
+MATH_TRANSCRIPTION_PROMPT = (
     "Read the main baseline and every subscript/superscript before writing LaTeX. "
     "Keep ALL lowered letters in one braced index on their actual base: "
     r"for a source R with lowered bun, write R_{bun} or R_{\text{bun}}, never Rb_{un}. "
@@ -573,7 +575,7 @@ def recognize_region(source, region, client, *, allow_text=True):
             "Recognize only the assigned source atoms in this crop. Nearby pixels are context, never additional output. "
             "Classify a complete mathematical expression as math; transcribe ALL operators, subscripts and superscripts "
             "in one LaTeX string. Preserve phi/varphi, Cyrillic/Latin subscripts and decimal commas exactly. "
-            + MATH_CLASSIFICATION_PROMPT
+            + MATH_CLASSIFICATION_PROMPT + MATH_TRANSCRIPTION_PROMPT
             + "Never guess unreadable content: set resolved=false.\nSOURCE:\n"
             + json.dumps(payload, ensure_ascii=False)
         )
