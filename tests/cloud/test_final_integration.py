@@ -185,6 +185,69 @@ class FinalIntegrationTests(unittest.TestCase):
                     )
                     self.assertEqual(client.request_count, len(owners))
 
+    def test_parenthetical_prose_opening_never_becomes_partial_math_ownership(self):
+        from copy import deepcopy
+        from marker.cloud.content import group_expression_regions
+        from marker.cloud.regions import analyze_page
+
+        for parenthesis in (
+            "(a valid solution)",
+            "( a valid solution )",
+            "( [ a valid solution ] )",
+        ):
+            for next_expression in (False, True):
+                with (
+                    self.subTest(
+                        parenthesis=parenthesis, next_expression=next_expression
+                    ),
+                    tempfile.TemporaryDirectory() as directory,
+                ):
+                    suffix = ", y = 1, I agree" if next_expression else ""
+                    sentence = "For x = 0 " + parenthesis + suffix
+                    expected = (
+                        "For $x = 0$ "
+                        + parenthesis
+                        + (", $y = 1$, I agree" if next_expression else "")
+                    )
+                    owners = [["x", "=", "0"]] + (
+                        [["y", "=", "1,"]] if next_expression else []
+                    )
+                    filename = Path(directory) / "parenthetical-prose.pdf"
+                    simple_pdf(filename, sentence)
+                    with PdfSource(filename) as source:
+                        regions = analyze_page(source, 0)
+                        original = deepcopy([r.atoms for r in regions])
+                        grouped = group_expression_regions(regions)
+                        self.assertEqual([r.atoms for r in regions], original)
+                        self.assertEqual(
+                            [
+                                [a["text"] for a in r.atoms]
+                                for r in grouped
+                                if r.kind == "math"
+                            ],
+                            owners,
+                        )
+                    client, observed = offline_client(
+                        lambda s, n: {
+                            "kind": "math",
+                            "resolved": True,
+                            "latex": " ".join(a["text"] for a in s["atoms"]).rstrip(
+                                ",;:"
+                            ),
+                        }
+                    )
+                    output = OllamaPdfConverter(artifact_dict={"cloud_client": client})(
+                        filename
+                    )
+                    self.assertEqual(
+                        output.metadata["cloud_conversion"]["status"], "complete"
+                    )
+                    self.assertEqual(output.markdown, expected)
+                    self.assertEqual(
+                        [[a["text"] for a in s["atoms"]] for s in observed], owners
+                    )
+                    self.assertEqual(client.request_count, len(owners))
+
     def test_bracketed_expression_owns_internal_separators_and_nested_operands(self):
         from copy import deepcopy
         from marker.cloud.content import group_expression_regions

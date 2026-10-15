@@ -175,26 +175,37 @@ def expression_groups(atoms):
     runs = []
     current = []
     bracket_depth = 0
+    opening_tail = None
     for atom in sorted(atoms, key=lambda a: a["bbox"][0]):
         text = atom.get("text", "").rstrip()
         if not member(atom) and not (bracket_depth and text in (",", ";", ":")):
+            # A prose word disproves an unfinished parenthetical math tail.
+            # Leave that entire tail with the original neighboring prose.
+            if bracket_depth:
+                current = current[:opening_tail]
             if current:
                 runs.append(current)
                 current = []
             bracket_depth = 0
+            opening_tail = None
             continue
         if current and atom["bbox"][0] - current[-1]["bbox"][2] > 16:
             runs.append(current)
             current = []
             bracket_depth = 0
+            opening_tail = None
         current.append(atom)
         # Bracketed intervals/arguments own internal separators, including
         # standalone punctuation atoms. Closing punctuation still ends a run.
         for character in text:
             if character in "([{":
+                if not bracket_depth:
+                    opening_tail = len(current) - 1
                 bracket_depth += 1
             elif character in ")]}":
                 bracket_depth = max(0, bracket_depth - 1)
+                if not bracket_depth:
+                    opening_tail = None
         if not bracket_depth and text.endswith((",", ";", ":")):
             runs.append(current)
             current = []
