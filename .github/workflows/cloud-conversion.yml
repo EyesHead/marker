@@ -43,9 +43,9 @@ jobs:
           enable-cache: true
       - name: Create Python environment
         run: uv venv --python 3.11
-      - name: Install CPU Torch on Linux and Windows
+      - name: Install CPU Torch and Torchvision on Linux and Windows
         if: runner.os != 'macOS'
-        run: uv pip install 'torch>=2.7,<3' --index-url https://download.pytorch.org/whl/cpu
+        run: uv pip install 'torch>=2.7,<3' 'torchvision>=0.20,<1' --index-url https://download.pytorch.org/whl/cpu
       - name: Install Marker without downloading model weights
         run: uv pip install --editable .
       - name: Run cloud conversion fixtures
@@ -87,8 +87,8 @@ jobs:
           enable-cache: true
       - name: Create portable Python environment
         run: uv venv --python '${{ matrix.python }}'
-      - name: Install CPU Torch
-        run: uv pip install 'torch>=2.7,<3' --index-url https://download.pytorch.org/whl/cpu
+      - name: Install CPU Torch and Torchvision
+        run: uv pip install 'torch>=2.7,<3' 'torchvision>=0.20,<1' --index-url https://download.pytorch.org/whl/cpu
       - name: Install Marker without downloading model weights
         run: uv pip install --editable .
       - name: Run cloud and HTML fixtures
