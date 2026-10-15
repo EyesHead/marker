@@ -72,6 +72,7 @@ class AzureOpenAIService(BaseService):
         for tries in range(1, total_tries + 1):
             try:
                 # parse() is GA in openai>=1.92 - use it directly (not beta)
+                options = {"max_completion_tokens": self.max_output_tokens} if self.max_output_tokens else {}
                 response = client.chat.completions.parse(
                     extra_headers={
                         "X-Title": "Marker",
@@ -81,6 +82,7 @@ class AzureOpenAIService(BaseService):
                     messages=messages,
                     timeout=timeout,
                     response_format=response_schema,
+                    **options,
                 )
                 response_text = response.choices[0].message.content
                 total_tokens = response.usage.total_tokens
@@ -114,4 +116,5 @@ class AzureOpenAIService(BaseService):
             api_version=self.azure_api_version,
             azure_endpoint=self.azure_endpoint,
             api_key=self.azure_api_key,
+            max_retries=0,
         )

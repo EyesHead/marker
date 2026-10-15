@@ -22,7 +22,7 @@ from marker.cloud.context import RecognitionFailure, fit_request
 from marker.cloud.math_evidence import with_math_closeups
 from marker.cloud.parallel import ordered_cloud_map
 from marker.cloud.regions import assess_text_quality, word_lines
-from marker.cloud.source import intersection
+from marker.cloud.source import intersection, object_bbox
 from marker.processors.table_geometry import (
     can_join_grids, extract_grids, grid_positions, join_grids, stack_grids,
 )
@@ -185,6 +185,42 @@ def detect_tables(source, page_ids=None) -> list[TablePart]:
     return parts
 
 
+def _clear_source_after_table(part):
+    """A short final table/header can continue despite a large blank page tail.
+
+    Require readable source evidence for this exception to the usual page-edge
+    gate. A missing optional source implementation keeps the old conservative
+    behavior; words, drawings or images after the table disprove a clear tail.
+    """
+    source = part.source
+    if source is None or not callable(getattr(source, "page_words", None)):
+        return False
+    try:
+        bottom = part.bbox[3] + 0.75
+
+        def follows(item):
+            if isinstance(item, dict):
+                box = item.get("bbox") or object_bbox(item)
+            else:
+                box = item.bbox
+            return box[3] >= bottom and box[3] >= box[1]
+
+        if any(str(word.get("text", "")).strip() and follows(word)
+               for word in source.page_words(part.page)):
+            return False
+        if callable(getattr(source, "page_images", None)) and any(
+                follows(image) for image in source.page_images(part.page)):
+            return False
+        if callable(getattr(source, "pdf_page", None)):
+            page = source.pdf_page(part.page)
+            if any(follows(item) for item in
+                   [*getattr(page, "edges", ()), *getattr(page, "curves", ())]):
+                return False
+    except (AttributeError, KeyError, OSError, TypeError, ValueError):
+        return False
+    return True
+
+
 def _compatible(first, second):
     if first.page+1 != second.page:
         return False
@@ -195,7 +231,7 @@ def _compatible(first, second):
         return False
     if min(*first.page_size, *second.page_size) <= 0:
         return False
-    if first.bbox[3] < first.page_size[1]*0.65 or second.bbox[1] > second.page_size[1]*0.35:
+    if second.bbox[1] > second.page_size[1]*0.35:
         return False
     tolerance = max(2, (first.bbox[2]-first.bbox[0])*0.01)
     if any(abs(first.bbox[i]-second.bbox[i]) > tolerance for i in (0, 2)):
@@ -210,6 +246,8 @@ def _compatible(first, second):
         # visible in later data rows; every original cut must still align.
         if any(not any(abs(cut-other) <= tolerance for other in fine) for cut in coarse):
             return False
+    if first.bbox[3] < first.page_size[1]*0.65 and not _clear_source_after_table(first):
+        return False
     return True
 
 

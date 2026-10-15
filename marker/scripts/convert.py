@@ -59,6 +59,17 @@ def worker_exit():
         pass
 
 
+def needs_local_vlm(cli_options):
+    """Native cloud recognition must not eagerly start the batch VLM server."""
+    parser = ConfigParser(cli_options)
+    converter_cls = parser.get_converter_cls()
+    config = parser.generate_config_dict()
+    if not getattr(converter_cls, "requires_model_dict", True) or config.get("disable_ocr"):
+        return False
+    policy = getattr(converter_cls, "uses_native_llm", None)
+    return not (policy and policy(config, parser.get_processors()))
+
+
 def process_single_pdf(args):
     page_count = 0
     fpath, cli_options = args
@@ -179,10 +190,10 @@ def convert_cli(in_folder: str, **kwargs):
 
     chunk_idx = kwargs["chunk_idx"]
 
-    no_server = bool(kwargs.get("disable_ocr"))
+    no_server = not needs_local_vlm(kwargs)
     if no_server:
-        # Pure text-layer mode: no VLM at all, so no server and the pool is
-        # sized purely by CPU cores.
+        # Text-layer/cloud mode: no local VLM server. Workers still use the
+        # lightweight native detector when the selected converter needs it.
         workers = kwargs["workers"] or get_worker_count(no_server=True)
         total_processes = max(1, min(len(files_to_convert), workers))
     else:

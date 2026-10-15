@@ -140,6 +140,12 @@ class LauncherTests(unittest.TestCase):
         converter.parent.mkdir(parents=True)
         converter.write_text("# adaptive converter capability", encoding="utf-8")
         (converter.parent/'ollama_document.py').write_text('# staged whole-object converter',encoding='utf-8')
+        native = self.remote / "marker/processors/llm/llm_native.py"
+        native.parent.mkdir(parents=True)
+        native.write_text("# native whole-object processor", encoding="utf-8")
+        defaults = self.remote / "marker/cloud/defaults.py"
+        defaults.parent.mkdir(parents=True)
+        defaults.write_text("# cloud model defaults", encoding="utf-8")
         (self.remote / "pyproject.toml").write_text("# installation fixture", encoding="utf-8")
         git("-C", self.remote, "add", ".")
         git("-C", self.remote, "commit", "-m", "Adaptive source")
@@ -229,7 +235,7 @@ class LauncherTests(unittest.TestCase):
         (source / "marker/converters/ollama.py").unlink()
         legacy = source / "marker/processors/llm/llm_table_json.py"
         if legacy_json:
-            legacy.parent.mkdir(parents=True)
+            legacy.parent.mkdir(parents=True, exist_ok=True)
             legacy.write_text("# old JSON pipeline", encoding="utf-8")
         git("-C", source, "add", ".")
         git("-C", source, "commit", "-m", "Legacy installation")
@@ -281,11 +287,11 @@ class LauncherTests(unittest.TestCase):
         status, stdout, stderr = self.run_launcher(env={"DISABLE_OCR": "1"})
         self.assertEqual(status, 0, stdout + stderr)
         args = self.process.conversions()[0][0]
-        for flag, value in {"--converter_cls": "marker.converters.ollama_document.StagedOllamaPdfConverter",
-                            "--output_format": "markdown", "--llm_service": "marker.services.openai.OpenAIService",
-                            "--openai_base_url": "https://ollama.com/v1", "--openai_model": "gemma4:31b",
+        for flag, value in {"--converter_cls": "marker.converters.pdf.PdfConverter",
+                            "--output_format": "markdown", "--llm_service": "marker.services.ollama.OllamaService",
+                            "--cloud_base_url": "https://ollama.com/v1", "--cloud_model": "kimi-k3",
                             "--cloud_context_tokens": "245760", "--cloud_max_output_tokens": "16384",
-                            "--cloud_max_images": "8", "--cloud_crop_dpi": "600",
+                            "--cloud_max_images": "16", "--cloud_crop_dpi": "600",
                             "--cloud_max_attempts": "3", "--cloud_max_requests": "0",
                             "--page_batch_size": "30"}.items():
             self.assertEqual(args[args.index(flag) + 1], value)
@@ -301,7 +307,7 @@ class LauncherTests(unittest.TestCase):
         )
         self.assertEqual(status, 0, stdout + stderr)
         args = self.process.conversions()[0][0]
-        for flag, value in {"--openai_model": "alternate-model", "--cloud_context_tokens": "4096",
+        for flag, value in {"--cloud_model": "alternate-model", "--cloud_context_tokens": "4096",
                             "--cloud_max_output_tokens": "1024", "--cloud_max_images": "2",
                             "--cloud_crop_dpi": "450", "--cloud_max_requests": "10",
                             "--cloud_max_attempts": "2"}.items():

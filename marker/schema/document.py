@@ -28,6 +28,7 @@ class Document(BaseModel):
     block_type: BlockTypes = BlockTypes.Document
     table_of_contents: List[TocItem] | None = None
     debug_data_path: str | None = None  # Path that debug data was saved to
+    cloud_conversion: dict | None = None
     _page_index: dict | None = None  # page_id -> PageGroup, built lazily
 
     def get_block(self, block_id: BlockId):

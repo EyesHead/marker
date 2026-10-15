@@ -104,6 +104,7 @@ class OpenRouterService(BaseService):
         total_tries = max_retries + 1
         for tries in range(1, total_tries + 1):
             try:
+                options = {"max_tokens": self.max_output_tokens} if self.max_output_tokens else {}
                 response = client.chat.completions.parse(
                     extra_headers=extra_headers,
                     extra_body=extra_body,
@@ -111,6 +112,7 @@ class OpenRouterService(BaseService):
                     messages=messages,
                     timeout=timeout,
                     response_format=response_schema,
+                    **options,
                 )
                 response_text = response.choices[0].message.content
                 usage = getattr(response, "usage", None)
@@ -141,4 +143,4 @@ class OpenRouterService(BaseService):
 
     def get_client(self) -> openai.OpenAI:
         api_key = self.openrouter_api_key or os.environ.get("OPENROUTER_API_KEY")
-        return openai.OpenAI(api_key=api_key, base_url=self.openrouter_base_url)
+        return openai.OpenAI(api_key=api_key, base_url=self.openrouter_base_url, max_retries=0)

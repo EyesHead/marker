@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Sequence, Tuple
+from typing import Any, TYPE_CHECKING, Dict, List, Literal, Optional, Sequence, Tuple
 
-from pydantic import BaseModel, ConfigDict, PrivateAttr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator
 from PIL import Image
 
 from marker.schema import BlockTypes
@@ -102,6 +102,10 @@ class Block(BaseModel):
     metadata: BlockMetadata | None = None
     lowres_image: Image.Image | None = None
     highres_image: Image.Image | None = None
+    embedded_images: Dict[str, Any] = Field(default_factory=dict)
+    # A complete semantic replacement, including image blocks recognized as
+    # text or math. Renderers must not append the original crop to this HTML.
+    llm_processed: bool = False
     removed: bool = False  # Has block been replaced by new block?
     _structure_index: Optional[dict] = PrivateAttr(default=None)
 
@@ -309,6 +313,15 @@ class Block(BaseModel):
         if section_hierarchy is None:
             section_hierarchy = {}
         section_hierarchy = self.assign_section_hierarchy(section_hierarchy)
+
+        if self.ignore_for_output or self.llm_processed:
+            return BlockOutput(
+                html="" if self.ignore_for_output else (getattr(self, "html", None) or ""),
+                polygon=self.polygon,
+                id=self.id,
+                children=[],
+                section_hierarchy=section_hierarchy,
+            )
 
         if self.structure is not None and len(self.structure) > 0:
             for block_id in self.structure:

@@ -6,6 +6,7 @@ import unittest
 from copy import deepcopy
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import openai
@@ -165,6 +166,78 @@ class LogicalTablesTests(unittest.TestCase):
             self.assertEqual([len(t.parts) for t in exhausted], [1, 1])
             self.assertEqual(client.request_count, 1)
             self.assertTrue(all(t.warnings for t in exhausted))
+
+    def short_header_parts(self, *, following_caption="", words=(), images=(), edges=(), source_available=True):
+        from marker.cloud.tables import TablePart
+
+        class Source:
+            def page_words(self, page):
+                return list(words)
+
+            def page_images(self, page):
+                return list(images)
+
+            def pdf_page(self, page):
+                return SimpleNamespace(edges=list(edges), curves=[])
+
+            def crop(self, page, box, dpi=None):
+                return Image.new("RGB", (240, 100), "black")
+
+        # Actual native И.2 header/body rectangles from PDF pages 58 and 59.
+        # The header ends at 62.9% of page height, before the old 65% cutoff.
+        source = Source() if source_available else SimpleNamespace()
+        return [
+            TablePart(57, (85.104, 298.51, 820.56, 374.59), None,
+                      (842.039978, 595.320007), "Таблица И.2 - Расчетные длины", source),
+            TablePart(58, (85.104, 57.02, 820.920015, 418.06), None,
+                      (842.039978, 595.320007), following_caption, source),
+        ]
+
+    def test_short_final_header_reaches_visual_decision_before_anonymous_body(self):
+        for merge, expected in ((True, [2]), (False, [1, 1])):
+            with self.subTest(merge=merge):
+                client = cloud_client(merge)
+                tables = self.group_tables(self.short_header_parts(), client)
+                self.assertEqual([len(table.parts) for table in tables], expected)
+                self.assertEqual(client.request_count, 1)
+
+    def test_short_final_header_with_same_explicit_id_has_positive_continuation_evidence(self):
+        parts = self.short_header_parts(following_caption="Продолжение таблицы И.2 - Расчетные длины")
+        tables = self.group_tables(parts, None)
+        self.assertEqual([len(table.parts) for table in tables], [2])
+
+    def test_short_header_cannot_borrow_next_page_after_disjoint_later_content(self):
+        cases = (
+            {"words": [{"text": "Another paragraph", "bbox": (25, 410, 180, 425)}]},
+            {"images": [SimpleNamespace(bbox=(25, 410, 180, 480))]},
+            {"images": [SimpleNamespace(bbox=(25, 300, 180, 480))]},
+            {"edges": [{"bbox": (25, 410, 180, 410)}]},
+        )
+        for evidence in cases:
+            with self.subTest(evidence=evidence):
+                client = cloud_client(True)
+                tables = self.group_tables(self.short_header_parts(**evidence), client)
+                self.assertEqual([len(table.parts) for table in tables], [1, 1])
+                self.assertEqual(client.request_count, 0)
+
+    def test_short_headers_with_different_table_ids_stay_separate(self):
+        client = cloud_client(True)
+        tables = self.group_tables(self.short_header_parts(following_caption="Таблица И.3"), client)
+        self.assertEqual([len(table.parts) for table in tables], [1, 1])
+        self.assertEqual(client.request_count, 0)
+
+    def test_short_anonymous_headers_are_never_blindly_joined(self):
+        from dataclasses import replace
+        parts = [replace(part, caption="") for part in self.short_header_parts()]
+        tables = self.group_tables(parts, None)
+        self.assertEqual([len(table.parts) for table in tables], [1, 1])
+        self.assertTrue(all(table.warnings for table in tables))
+
+    def test_short_header_without_optional_source_protocol_keeps_original_gate(self):
+        client = cloud_client(True)
+        tables = self.group_tables(self.short_header_parts(source_available=False), client)
+        self.assertEqual([len(table.parts) for table in tables], [1, 1])
+        self.assertEqual(client.request_count, 0)
 
 
 if __name__ == "__main__":

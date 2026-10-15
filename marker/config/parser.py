@@ -138,7 +138,7 @@ class ConfigParser:
 
         service_cls = self.cli_options.get("llm_service", None)
         if service_cls is None:
-            service_cls = "marker.services.gemini.GoogleGeminiService"
+            service_cls = "marker.services.ollama.OllamaService"
         return service_cls
 
     def get_renderer(self):

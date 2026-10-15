@@ -1,17 +1,19 @@
 """One compact normalized discovery job per scanned source rectangle."""
 
 from copy import deepcopy
+from collections import Counter
 import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from PIL import Image
 
 from marker.cloud.context import RecognitionFailure
 from marker.cloud.regions import Region, assess_text_quality
 from marker.cloud.scan_regions import discover_scan
-from marker.cloud.tables import group_tables
+from marker.cloud.tables import TablePart, group_tables
 
 
 class Source:
@@ -290,6 +292,149 @@ class ScanRegionTests(unittest.TestCase):
                     store=store,
                 )
             self.assertFalse((store.root / "scan-layout.json").exists())
+
+
+class ScanOwnerReconciliationTests(unittest.TestCase):
+    @staticmethod
+    def owner(page, box, kind, atoms=(), grid=None):
+        return Region(page, box, kind, tuple(atoms), assess_text_quality([], box), grid=grid)
+
+    @staticmethod
+    def word(page, box, text):
+        return {"kind": "text", "bbox": box, "source_bbox": box,
+                "source_page": page, "text": text}
+
+    @staticmethod
+    def frame(page, box):
+        left, top, right, bottom = box
+        lines = [(left, top, left, bottom), (right, top, right, bottom)]
+        lines.extend((left, top + (bottom - top) * index / 52, right,
+                      top + (bottom - top) * index / 52) for index in range(53))
+        return tuple({"kind": "vector", "bbox": line, "source_bbox": line,
+                      "source_page": page,
+                      "crop_bbox": (line[0] - .5, line[1] - .5,
+                                    line[2] + .5, line[3] + .5)} for line in lines)
+
+    def test_larger_ruled_table_replaces_partial_grid_and_owns_native_atoms_once(self):
+        from marker.converters.ollama_document import _discover_scans
+
+        # Bounds and saved normalized layout from the failed document's page 60.
+        source = Source((842.04, 595.32))
+        page = 60
+        box = (84.244, 56.16, 753.61997, 373.89)
+        vectors = self.frame(page, (84.744, 56.66, 753.11997, 373.39))
+        vector_owner = self.owner(page, box, "unknown", vectors)
+        image_box = (113.05, 62.3, 169.3, 192.85)
+        image_atom = {"kind": "image", "bbox": image_box, "source_bbox": image_box,
+                      "source_page": page, "image_index": 0}
+        image_owner = self.owner(page, image_box, "image", (image_atom,))
+        title = self.word(page, (218.78, 63.71, 742.606, 72.71), "Коэффициенты")
+        title_owner = self.owner(page, title["bbox"], "text", (title,))
+        cell = self.word(page, (225, 210, 250, 219), "0,42")
+        grid = {"bbox": (219.3, 203.58, 744.606, 368.88),
+                "cells": [{"id": "c0", "atoms": [cell]}]}
+        native = TablePart(page, grid["bbox"], grid, source.size)
+        native_owner = self.owner(page, native.bbox, "table", (cell,), native.grid)
+        outside = self.word(page, (100, 390, 200, 400), "Следующая таблица")
+        outside_owner = self.owner(page, outside["bbox"], "text", (outside,))
+        original = [vector_owner, image_owner, title_owner, native_owner, outside_owner]
+        snapshot = deepcopy([(region.bbox, region.atoms) for region in original])
+        client = Client([{"complete": True, "regions": [
+            {"kind": "figure", "bbox": [48, 44, 135, 325]},
+            {"kind": "table", "bbox": [201, 44, 993, 965]},
+        ]}])
+
+        owners, parts, reasons = _discover_scans(source, original, [native], client, None)
+
+        self.assertEqual(reasons, [])
+        self.assertEqual(len(client.calls), 1, "The diagram is already owned by its whole table")
+        self.assertEqual(len(parts), 1)
+        self.assertIsNone(parts[0].grid, "A partial native grid cannot be stretched into a full grid")
+        for actual, expected in zip(parts[0].bbox, box):
+            self.assertAlmostEqual(actual, expected, places=9)
+        self.assertEqual(native.grid, grid)
+        self.assertIn(outside_owner, owners)
+        table = next(region for region in owners if region.kind == "table")
+        self.assertIsNone(table.grid)
+        self.assertTrue(all(atom in table.atoms for atom in (*vectors, image_atom, title, cell)))
+        original_atoms = [atom for region in original for atom in region.atoms]
+        counts = Counter(id(atom) for region in owners for atom in region.atoms)
+        self.assertTrue(all(counts[id(atom)] == 1 for atom in original_atoms))
+        self.assertEqual([(region.bbox, region.atoms) for region in original], snapshot)
+
+    def test_saved_page_eight_bounds_keep_partial_native_cell_beyond_model_edge(self):
+        from marker.converters.ollama_document import _discover_scans
+
+        source = Source((842.04, 595.32))
+        page = 8
+        box = (84.244, 56.16, 794.78003, 532.1)
+        vectors = self.frame(page, (84.744, 56.66, 794.28003, 531.6))
+        broad = self.owner(page, box, "unknown", vectors)
+        cell = self.word(page, (740, 400, 751.566, 409), "ячейка")
+        native = TablePart(page, (106.98, 367.022, 751.566, 423.51),
+                           {"cells": [{"atoms": [cell]}]}, source.size)
+        old = self.owner(page, native.bbox, "table", (cell,), native.grid)
+        client = Client([response(box=(0, 0, 935, 993), caption="Колонны")])
+
+        owners, parts, reasons = _discover_scans(source, [broad, old], [native], client, None)
+
+        self.assertEqual(reasons, [])
+        self.assertEqual(len(parts), 1)
+        for actual, expected in zip(parts[0].bbox, box):
+            self.assertAlmostEqual(actual, expected, places=9)
+        self.assertIsNone(parts[0].grid)
+        self.assertEqual(sum(atom is cell for region in owners for atom in region.atoms), 1)
+
+    def test_disjoint_vector_support_does_not_make_its_envelope_a_crossing_owner(self):
+        from marker.converters.ollama_document import _discover_scans
+
+        source = Source((600, 800))
+        bitmap = parent(0, (100, 100, 300, 300))
+        atoms = self.frame(0, (10, 10, 20, 20))[:2] + self.frame(0, (380, 380, 390, 390))[:2]
+        envelope = self.owner(0, (9.5, 9.5, 390.5, 390.5), "unknown", atoms)
+        client = Client([response(kind="figure", box=(0, 0, 1000, 1000), caption="")])
+
+        owners, parts, reasons = _discover_scans(source, [envelope, bitmap], [], client, None)
+
+        self.assertEqual(reasons, [])
+        self.assertEqual(parts, [])
+        self.assertEqual(len(client.calls), 1)
+        self.assertIn(envelope, owners)
+        self.assertTrue(any(owner.kind == "figure" and owner.bbox == bitmap.bbox for owner in owners))
+
+    def test_crossing_paragraph_partitions_whole_atoms_without_changing_coordinates(self):
+        from marker.converters.ollama_document import _discover_scans
+
+        source = Source((400, 500))
+        bitmap = parent(0, (100, 100, 300, 300))
+        inside = self.word(0, (110, 110, 180, 120), "подпись")
+        outside = self.word(0, (50, 210, 90, 220), "снаружи")
+        prose = self.owner(0, (50, 110, 180, 220), "text", (inside, outside))
+        client = Client([response(kind="figure", box=(0, 0, 1000, 1000), caption="")])
+
+        owners, _, reasons = _discover_scans(source, [bitmap, prose], [], client, None)
+
+        self.assertEqual(reasons, [])
+        figure = next(region for region in owners if region.kind == "figure")
+        self.assertIn(inside, figure.atoms)
+        residual = next(region for region in owners if region.kind == "text")
+        self.assertEqual(residual.atoms, (outside,))
+        self.assertEqual(residual.bbox, outside["bbox"])
+        self.assertIs(residual.atoms[0], outside)
+        self.assertEqual(prose.atoms, (inside, outside))
+
+    def test_embedded_bitmap_layout_validation_failure_routes_original_whole_object(self):
+        from marker.converters.ollama_document import _discover_scans
+
+        source = Source((842.04, 595.32))
+        bitmap = parent(5, (254.05, 202.7, 630.6, 455.4))
+        with patch("marker.cloud.scan_regions.discover_scan", side_effect=RecognitionFailure("JSON: value_error")):
+            owners, parts, reasons = _discover_scans(source, [bitmap], [], None, None)
+
+        self.assertEqual(reasons, [])
+        self.assertEqual(parts, [])
+        self.assertEqual(owners, [bitmap])
+        self.assertIs(owners[0], bitmap)
 
 
 if __name__ == "__main__":

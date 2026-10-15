@@ -49,7 +49,8 @@ class JSONRenderer(BaseRenderer):
 
     def extract_json(self, document: Document, block_output: BlockOutput):
         cls = get_block_class(block_output.id.block_type)
-        if cls.__base__ == Block:
+        source = self._source_block(document, block_output.id)
+        if cls.__base__ == Block or getattr(source, "llm_processed", False):
             html, images = self.extract_block_html(document, block_output)
             return JSONBlockOutput(
                 html=html,
@@ -68,6 +69,14 @@ class JSONRenderer(BaseRenderer):
                 child_output = self.extract_json(document, child)
                 children.append(child_output)
 
+            images = None
+            if (source is not None and not source.ignore_for_output
+                    and self.extract_images and source.embedded_images):
+                images = {
+                    name: self._encode_embedded_image(name, resource)
+                    for name, resource in source.embedded_images.items()
+                }
+
             return JSONBlockOutput(
                 html=block_output.html,
                 polygon=block_output.polygon.polygon,
@@ -75,6 +84,7 @@ class JSONRenderer(BaseRenderer):
                 id=str(block_output.id),
                 block_type=str(block_output.id.block_type),
                 children=children,
+                images=images,
                 section_hierarchy=reformat_section_hierarchy(
                     block_output.section_hierarchy
                 ),

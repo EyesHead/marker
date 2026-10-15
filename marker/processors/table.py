@@ -63,6 +63,9 @@ class TableProcessor(BaseProcessor):
     disable_ocr: Annotated[bool, "Disable OCR entirely."] = False
     extract_images: Annotated[bool, "Preserve source images inside table cells."] = True
     table_geometry: Annotated[bool, "Build ruled PDF tables from physical cell coordinates."] = True
+    table_source_coordinates: Annotated[
+        bool, "Use the visible PDF coordinate frame for cloud table source geometry."
+    ] = False
 
     def __init__(
         self,
@@ -114,9 +117,14 @@ class TableProcessor(BaseProcessor):
     def prepare_geometry_tables(self, document):
         if not self.table_geometry or not os.path.isfile(document.filepath) or not document.filepath.lower().endswith('.pdf'):
             return
-        with pdfplumber.open(document.filepath) as pdf:
+        if self.table_source_coordinates:
+            from marker.cloud.source import PdfSource
+            context = PdfSource(document.filepath)
+        else:
+            context = pdfplumber.open(document.filepath)
+        with context as pdf:
             for page in document.pages:
-                source = pdf.pages[page.page_id]
+                source = pdf.pdf_page(page.page_id) if self.table_source_coordinates else pdf.pages[page.page_id]
                 grids = extract_grids(source)
                 existing = list(page.contained_blocks(document, (BlockTypes.Table,)))
                 for grid in grids:
@@ -141,7 +149,8 @@ class TableProcessor(BaseProcessor):
                     block.html = render_grid(grid)
                     block.structure = []
                     block.text_extraction_method = 'pdftext'
-                source.close()
+                if not self.table_source_coordinates:
+                    source.close()
 
     def collect_tables(self, document: Document) -> dict:
         return {

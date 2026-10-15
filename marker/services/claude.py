@@ -39,6 +39,7 @@ class ClaudeService(BaseService):
     def get_client(self):
         return anthropic.Anthropic(
             api_key=self.claude_api_key,
+            max_retries=0,
         )
 
     def __call__(

@@ -51,7 +51,7 @@ from marker.schema.blocks import Block
 from marker.schema.registry import register_block_class
 from marker.util import strings_to_classes
 from marker.processors.llm.llm_handwriting import LLMHandwritingProcessor
-from marker.services.gemini import GoogleGeminiService
+from marker.services.ollama import OllamaService
 from marker.processors.line_merge import LineMergeProcessor
 from marker.processors.llm.llm_mathblock import LLMMathBlockProcessor
 from marker.processors.llm.llm_page_correction import LLMPageCorrectionProcessor
@@ -73,6 +73,10 @@ class PdfConverter(BaseConverter):
         bool,
         "Enable higher quality processing with LLMs.",
     ] = False
+    llm_native_pipeline: Annotated[
+        bool,
+        "Use native Marker geometry followed by whole-table/whole-expression LLM recognition.",
+    ] = True
     page_batch_size: Annotated[
         int,
         "Number of PDF pages to recognize in each batch. Tables are joined across batch boundaries.",
@@ -114,7 +118,15 @@ class PdfConverter(BaseConverter):
         BlankPageProcessor,
         DebugProcessor,
     )
-    default_llm_service: BaseService = GoogleGeminiService
+    default_llm_service: BaseService = OllamaService
+
+    @classmethod
+    def uses_native_llm(cls, config, processor_list=None):
+        """Resolve the same policy before construction (including batch setup)."""
+        def setting(name):
+            return config.get(f"{cls.__name__}_{name}", config.get(name, getattr(cls, name)))
+        return bool(setting("use_llm") and setting("llm_native_pipeline")
+                    and processor_list is None)
 
     def __init__(
         self,
@@ -138,6 +150,7 @@ class PdfConverter(BaseConverter):
             )
         self.config = config
         self.mode = config["mode"]
+        self.native_llm = self.uses_native_llm(config, processor_list)
         if self.page_batch_size < 1:
             raise ValueError("page_batch_size must be at least 1")
 
@@ -148,6 +161,15 @@ class PdfConverter(BaseConverter):
             processor_list = strings_to_classes(processor_list)
         else:
             processor_list = self.default_processors
+        if self.native_llm:
+            # Native extraction produces source structure only. One later
+            # processor owns each complete logical table and math/text block;
+            # old independent table/math rewrites must not run as well.
+            processor_list = tuple(
+                processor for processor in processor_list
+                if not issubclass(processor, BaseLLMProcessor)
+                and processor is not EquationProcessor
+            )
 
         if renderer:
             renderer = strings_to_classes([renderer])[0]
@@ -160,7 +182,7 @@ class PdfConverter(BaseConverter):
         if llm_service:
             llm_service_cls = strings_to_classes([llm_service])[0]
             llm_service = self.resolve_dependencies(llm_service_cls)
-        elif config.get("use_llm", False):
+        elif self.use_llm:
             llm_service = self.resolve_dependencies(self.default_llm_service)
 
         # Inject llm service into artifact_dict so it can be picked up by processors, etc.
@@ -169,11 +191,45 @@ class PdfConverter(BaseConverter):
 
         self.renderer = renderer
 
-        processor_list = self.initialize_processors(processor_list)
+        if self.native_llm:
+            original_config = self.config
+            self.config = self.source_config()
+            try:
+                processor_list = self.initialize_processors(processor_list)
+            finally:
+                self.config = original_config
+        else:
+            processor_list = self.initialize_processors(processor_list)
         self.processor_list = processor_list
+
+        self.native_llm_processor = None
+        if self.native_llm:
+            from marker.processors.llm.llm_native import NativeLLMProcessor
+            original_config = self.config
+            self.config = {**self.config, "use_llm": self.use_llm}
+            try:
+                self.native_llm_processor = self.resolve_dependencies(NativeLLMProcessor)
+            finally:
+                self.config = original_config
 
         self.layout_builder_class = LayoutBuilder
         self.page_count = None  # Track how many pages were converted
+
+    def source_config(self):
+        """Keep local layout/text extraction free of a local VLM server.
+
+        Public force/disable OCR settings are retained in self.config for the
+        cloud content stage. The source stage always reads the original layer.
+        """
+        config = dict(self.config)
+        config.update(disable_ocr=True, force_ocr=False, mode="fast",
+                      TableProcessor_disable_ocr=True,
+                      TableProcessor_table_source_coordinates=True,
+                      LayoutBuilder_disable_ocr=True, LayoutBuilder_mode="fast",
+                      LayoutBuilder_force_ocr=False, LineBuilder_disable_ocr=True,
+                      LineBuilder_mode="fast", DocumentBuilder_disable_ocr=True,
+                      PdfProvider_disable_ocr=True, PdfProvider_force_ocr=False)
+        return config
 
     @contextmanager
     def filepath_to_str(self, file_input: Union[str, io.BytesIO]):
@@ -200,17 +256,25 @@ class PdfConverter(BaseConverter):
 
     def build_document(self, filepath: str) -> Document:
         provider_cls = provider_from_filepath(filepath)
-        layout_builder = self.resolve_dependencies(self.layout_builder_class)
-        line_builder = self.resolve_dependencies(LineBuilder)
-        ocr_builder = self.resolve_dependencies(OcrBuilder)
-        provider = provider_cls(filepath, self.config)
-        document = DocumentBuilder(self.config)(
-            provider, layout_builder, line_builder, ocr_builder
-        )
+        original_config = self.config
+        if self.native_llm:
+            self.config = self.source_config()
+        try:
+            layout_builder = self.resolve_dependencies(self.layout_builder_class)
+            line_builder = self.resolve_dependencies(LineBuilder)
+            ocr_builder = self.resolve_dependencies(OcrBuilder)
+            provider = provider_cls(filepath, self.config)
+            document = DocumentBuilder(self.config)(
+                provider, layout_builder, line_builder, ocr_builder
+            )
+        finally:
+            self.config = original_config
         structure_builder_cls = self.resolve_dependencies(StructureBuilder)
         structure_builder_cls(document)
 
         self.run_processors(document)
+        if self.native_llm_processor is not None:
+            self.native_llm_processor(document)
 
         return document
 

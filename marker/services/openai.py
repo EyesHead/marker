@@ -109,10 +109,12 @@ class OpenAIService(BaseService):
                         timeout=timeout, temperature=0, **options,
                     )
                 else:
+                    options = {"max_completion_tokens": self.max_output_tokens} if self.max_output_tokens else {}
                     response = client.chat.completions.parse(
                         extra_headers={"X-Title": "Marker", "HTTP-Referer": "https://github.com/datalab-to/marker"},
                         model=self.openai_model, messages=messages, timeout=timeout,
                         response_format=response_schema,
+                        **options,
                     )
                 total_tokens = response.usage.total_tokens if response.usage else 0
                 if block:

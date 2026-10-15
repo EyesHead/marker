@@ -67,6 +67,36 @@ def atom_id(atom, page=None):
     return "a" + hashlib.sha256(repr(payload).encode()).hexdigest()[:16]
 
 
+def prompt_source_evidence(atoms, box, page=None):
+    """Describe original objects in the request crop's coordinate frame.
+
+    Keep individual word boxes, including lowered letters, rather than giving
+    the model only flattened text. Normalization affects this disposable
+    description; neither PDF objects nor their source coordinates are changed.
+    """
+    width, height = box[2] - box[0], box[3] - box[1]
+    if width <= 0 or height <= 0:
+        raise RecognitionFailure("Source evidence requires valid crop bounds")
+    objects = []
+    for atom in atoms:
+        original = atom.get("source_bbox", atom["bbox"])
+        item = {"id": atom_id(atom, page), "kind": atom.get("kind", "text"),
+                "bbox": [round((original[i] - box[i % 2]) /
+                               (width if i % 2 == 0 else height) * 1000, 3)
+                         for i in range(4)]}
+        if item["kind"] == "text":
+            item["text"] = atom.get("text", "")
+            if "size" in atom:
+                item["font_size"] = round(atom["size"] / height * 1000, 3)
+            if re.search(r"math|symbol|cmmi|cmsy", atom.get("fontname", ""), re.I):
+                item["math_font"] = True
+            for style in ("italic", "bold"):
+                if atom.get(style):
+                    item[style] = True
+        objects.append(item)
+    return {"atoms": objects, "script_hints": source_script_hints(atoms)}
+
+
 def bounds(atoms, *, layout=False):
     boxes = [
         a.get("layout_bbox", a["bbox"]) if layout else a.get("source_bbox", a["bbox"])

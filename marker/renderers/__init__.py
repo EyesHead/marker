@@ -2,6 +2,7 @@ import base64
 import io
 import re
 from collections import Counter
+from copy import deepcopy
 from typing import Annotated, Optional, Tuple, Literal
 
 from bs4 import BeautifulSoup
@@ -124,8 +125,26 @@ class BaseRenderer:
         }
         if document.debug_data_path is not None:
             metadata["debug_data_path"] = document.debug_data_path
+        if document.cloud_conversion is not None:
+            metadata["cloud_conversion"] = deepcopy(document.cloud_conversion)
 
         return metadata
+
+    @staticmethod
+    def _source_block(document: Document, block_id: BlockId):
+        if block_id.block_type == BlockTypes.Page or block_id.block_id is None:
+            return document.get_page(block_id.page_id)
+        return document.get_block(block_id)
+
+    @staticmethod
+    def _encode_embedded_image(name, image):
+        image_format = "PNG" if name.lower().endswith(".png") else settings.OUTPUT_IMAGE_FORMAT
+        if image_format.upper() != "PNG" and image.mode != "RGB":
+            image = image.convert("RGB")
+        stream = io.BytesIO()
+        # Retained PNG resources copy encoded bytes here without decoding.
+        image.save(stream, format=image_format)
+        return base64.b64encode(stream.getvalue()).decode(settings.OUTPUT_ENCODING)
 
     def _splice_block_html(self, document: Document, block_output: BlockOutput):
         # Resolve <content-ref> placeholders by string substitution instead of
@@ -134,6 +153,10 @@ class BaseRenderer:
         # children keep their content-ref placeholder and contribute their
         # extracted crop to `images` (their sub-tree images are discarded, as
         # before). Returns the raw spliced html; extract_block_html normalizes.
+        source = self._source_block(document, block_output.id)
+        if source is not None and source.ignore_for_output:
+            return "", {}
+
         images = {}
         children = {str(c.id): c for c in (block_output.children or [])}
 
@@ -142,7 +165,11 @@ class BaseRenderer:
             if child is None:
                 return match.group(0)
             block_id: BlockId = child.id
-            if block_id.block_type in self.image_blocks and self.extract_images:
+            child_source = self._source_block(document, block_id)
+            if child_source is not None and child_source.ignore_for_output:
+                return ""
+            if (block_id.block_type in self.image_blocks and self.extract_images
+                    and not getattr(child_source, "llm_processed", False)):
                 images[block_id] = self.extract_image(
                     document, block_id, to_base64=True
                 )
@@ -153,10 +180,16 @@ class BaseRenderer:
 
         html = CONTENT_REF_RE.sub(repl, block_output.html)
 
-        if block_output.id.block_type in self.image_blocks and self.extract_images:
+        if (block_output.id.block_type in self.image_blocks and self.extract_images
+                and not getattr(source, "llm_processed", False)):
             images[block_output.id] = self.extract_image(
                 document, block_output.id, to_base64=True
             )
+        if source is not None and self.extract_images:
+            images.update({
+                name: self._encode_embedded_image(name, resource)
+                for name, resource in source.embedded_images.items()
+            })
 
         return html, images
 

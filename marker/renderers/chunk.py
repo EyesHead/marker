@@ -43,7 +43,7 @@ def assemble_html_with_images(block: JSONBlockOutput, image_blocks: set[str]) ->
     # historical escape-then-unescape of inlined children is load-bearing for
     # byte-identical output (e.g. literal <img> tags in figure groups).
     if not getattr(block, "children", None):
-        if block.block_type in image_blocks:
+        if block.block_type in image_blocks and block.id in (block.images or {}):
             return f"<p>{block.html}<img src='{block.id}'></p>"
         else:
             return block.html

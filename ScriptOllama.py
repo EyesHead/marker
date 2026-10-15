@@ -17,7 +17,7 @@ import warnings
 
 REPOSITORY = "https://github.com/EyesHead/marker.git"
 REF = "codex/my-change"
-CONVERTER = "marker.converters.ollama_document.StagedOllamaPdfConverter"
+CONVERTER = "marker.converters.pdf.PdfConverter"
 
 
 class LauncherError(Exception):
@@ -182,6 +182,8 @@ class Processes:
 def adaptive_source(source):
     return ((source / "marker/converters/ollama.py").is_file()
             and (source / "marker/converters/ollama_document.py").is_file()
+            and (source / "marker/processors/llm/llm_native.py").is_file()
+            and (source / "marker/cloud/defaults.py").is_file()
             and not (source / "marker/processors/llm/llm_table_json.py").exists())
 
 
@@ -252,9 +254,9 @@ def conversion_arguments(args, python, pdf, output):
     command = [python, "-m", "marker.scripts.convert_single", pdf,
                "--converter_cls", CONVERTER, "--output_dir", output,
                "--output_format", "markdown", "--use_llm",
-               "--llm_service", "marker.services.openai.OpenAIService",
-               "--openai_base_url", args.base_url, "--openai_model", args.model,
-               "--openai_image_format", "png", "--max_concurrency", "1", "--timeout", "180",
+               "--llm_service", "marker.services.ollama.OllamaService",
+               "--cloud_base_url", args.base_url, "--cloud_model", args.model,
+               "--timeout", "180",
                "--page_batch_size", args.page_batch_size, "--redo_inline_math"]
     for field in ("context_tokens", "max_output_tokens", "max_images", "crop_dpi", "max_attempts", "max_requests", "max_concurrency"):
         command.extend(["--cloud_" + field, getattr(args, field)])
@@ -323,10 +325,10 @@ def parse_arguments(argv):
     parser.add_argument("--cache-dir", type=Path, default=default_cache_dir())
     parser.add_argument("--repo", default=os.environ.get("MARKER_REPO", REPOSITORY))
     parser.add_argument("--ref", default=os.environ.get("MARKER_REF", REF))
-    parser.add_argument("--model", default=os.environ.get("OLLAMA_MODEL", "gemma4:31b"))
+    parser.add_argument("--model", default=os.environ.get("OLLAMA_MODEL", "kimi-k3"))
     parser.add_argument("--base-url", default=os.environ.get("OLLAMA_BASE_URL", "https://ollama.com/v1"))
     for name, default in (("context_tokens", 245760), ("max_output_tokens", 16384),
-                          ("max_images", 8), ("crop_dpi", 600), ("max_attempts", 3), ("max_requests", 0), ("max_concurrency", 2)):
+                          ("max_images", 16), ("crop_dpi", 600), ("max_attempts", 3), ("max_requests", 0), ("max_concurrency", 2)):
         parser.add_argument("--" + name.replace("_", "-"), type=int,
                             default=os.environ.get("CLOUD_" + name.upper(), default))
     parser.add_argument("--page-batch-size", type=int, default=os.environ.get("PAGE_BATCH_SIZE", 30))
@@ -402,7 +404,7 @@ def main(argv=None) -> int:
                             processes.message("  " + reason, error=True)
                         continue
                     backup=publish_output(generated, note, pdf.stem, secret,
-                                          replace_generated=status.get('pipeline')=='whole-object-v1')
+                                          replace_generated=status.get('pipeline') in {'whole-object-v1', 'native-marker-v1'})
                     if backup:
                         processes.message(f"Previous generated resources retained in hidden backup: {backup}")
                     if status["status"] == "incomplete":

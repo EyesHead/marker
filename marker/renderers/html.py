@@ -99,7 +99,11 @@ class HTMLRenderer(BaseRenderer):
             if child is None:
                 return ""
             block_id: BlockId = child.id
-            if block_id.block_type in self.image_blocks:
+            source = self._source_block(document, block_id)
+            if source is not None and source.ignore_for_output:
+                return ""
+            if (block_id.block_type in self.image_blocks
+                    and not getattr(source, "llm_processed", False)):
                 # Image blocks keep only the extracted crop; their sub-tree's
                 # images are discarded (matches prior behavior), so recurse with
                 # a throwaway image dict.
@@ -120,10 +124,8 @@ class HTMLRenderer(BaseRenderer):
                     )
             else:
                 content = self.splice_content_refs(document, child, images)
-                if block_id.block_type in (BlockTypes.Table, BlockTypes.TableOfContents):
-                    table = document.get_block(block_id)
-                    if self.extract_images and table is not None:
-                        images.update(getattr(table, "embedded_images", {}))
+            if self.extract_images and source is not None:
+                images.update(source.embedded_images)
             if self.add_block_ids:
                 content = self.insert_block_id_str(content, block_id)
             return content
