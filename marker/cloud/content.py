@@ -153,6 +153,12 @@ def expression_groups(atoms):
         if re.fullmatch(r"[A-Za-zА-Яа-я]", text):
             return True
         if re.fullmatch(r"[A-Za-zА-Яа-я0-9]+", text):
+            # PdfSource words expose fontname/size, without the optional
+            # table-style italic flag. Use the same explicit math-font signal
+            # as math_required so operands cannot be excluded from a formula
+            # that their own font makes mandatory.
+            if re.search(r"math|symbol|cmmi|cmsy", atom.get("fontname", ""), re.I):
+                return True
             size = atom.get("size", atom["bbox"][3] - atom["bbox"][1])
             return size < baseline_size * 0.8 or (atom.get("italic") and len(text) <= 4)
         return False

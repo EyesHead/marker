@@ -23,6 +23,47 @@ from marker.renderers.markdown import MarkdownOutput, Markdownify
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
+def math_font_pdf(path):
+    """Small real PDF with explicit math font metadata and no optional test deps."""
+    widths = " ".join(["600"] * 256)
+    fonts = []
+    for name, encoding in [
+        ("CMMI10", "/WinAnsiEncoding"),
+        ("CMSY10", "<< /Differences [97 /greaterequal] >>"),
+        ("CMR10", "/WinAnsiEncoding"),
+    ]:
+        fonts.append(
+            (
+                f"<< /Type /Font /Subtype /Type1 /BaseFont /{name} /Encoding {encoding} "
+                f"/FirstChar 0 /LastChar 255 /Widths [{widths}] "
+                f"/FontDescriptor << /Type /FontDescriptor /FontName /{name} /Flags 4 /FontBBox [0 -200 600 800] "
+                "/ItalicAngle 0 /Ascent 800 /Descent -200 /CapHeight 700 /StemV 80 >> >>"
+            ).encode()
+        )
+    stream = b"BT /F4 10 Tf 20 50 Td (For) Tj ET\nBT /F1 10 Tf 45 50 Td (xy) Tj ET\nBT /F2 10 Tf 60 50 Td (a) Tj ET\nBT /F3 10 Tf 70 50 Td (0) Tj ET\nBT /F4 10 Tf 90 50 Td (where) Tj ET"
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 180 100] /Resources << /Font << /F1 4 0 R /F2 5 0 R /F3 6 0 R /F4 7 0 R >> >> /Contents 8 0 R >>",
+        *fonts,
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        f"<< /Length {len(stream)} >>\nstream\n".encode() + stream + b"\nendstream",
+    ]
+    data = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = [0]
+    for index, obj in enumerate(objects, 1):
+        offsets.append(len(data))
+        data.extend(f"{index} 0 obj\n".encode() + obj + b"\nendobj\n")
+    start = len(data)
+    data.extend(f"xref\n0 {len(objects)+1}\n0000000000 65535 f \n".encode())
+    for offset in offsets[1:]:
+        data.extend(f"{offset:010} 00000 n \n".encode())
+    data.extend(
+        f"trailer\n<< /Size {len(objects)+1} /Root 1 0 R >>\nstartxref\n{start}\n%%EOF\n".encode()
+    )
+    Path(path).write_bytes(data)
+
+
 def offline_client(responder, config=None):
     observed = []
 
@@ -1020,6 +1061,180 @@ class ContentTests(unittest.TestCase):
             self.assertIn(
                 "min-width:200.000pt", merged.find("div", recursive=False)["style"]
             )
+
+    def test_extracted_math_font_multiletter_operand_keeps_ordinary_prose_separate(
+        self,
+    ):
+        from marker.cloud.content import expression_groups
+
+        with tempfile.TemporaryDirectory() as directory:
+            filename = Path(directory) / "math-font.pdf"
+            math_font_pdf(filename)
+            with PdfSource(filename) as source:
+                atoms = source.page_words(0)
+                xy = next(a for a in atoms if a["text"] == "xy")
+                self.assertEqual(xy["fontname"], "CMMI10")
+                self.assertEqual(xy["size"], 10)
+                self.assertNotIn(
+                    "italic",
+                    xy,
+                    "Grouping must use actual PDF metadata, not a manufactured style flag",
+                )
+                self.assertEqual(
+                    [[a["text"] for a in group] for group in expression_groups(atoms)],
+                    [["xy", "≥", "0"]],
+                )
+
+    def test_extracted_math_font_operand_partial_rejected_and_whole_accepted(self):
+        from marker.cloud.content import atom_id
+        from marker.cloud.tables import _describe_cells, _table_schema
+        from marker.processors.table_geometry import grid_positions
+        from pydantic import ValidationError
+
+        with tempfile.TemporaryDirectory() as directory:
+            filename = Path(directory) / "math-font.pdf"
+            math_font_pdf(filename)
+            with PdfSource(filename) as source:
+                atoms = source.page_words(0)
+                bbox = (15, 35, 140, 65)
+                grid = {
+                    "page": 0,
+                    "bbox": bbox,
+                    "trusted": False,
+                    "cells": [{"bbox": bbox, "source_page": 0, "atoms": atoms}],
+                }
+                described, _ = _describe_cells(grid, grid_positions(grid)[2])
+                cell = described[0]
+                line = cell["lines"][0]
+                lookup = {a["text"]: atom_id(a, 0) for a in atoms}
+                whole = {
+                    "cells": [
+                        {
+                            key: cell[key]
+                            for key in ("id", "row", "column", "rowspan", "colspan")
+                        }
+                        | {
+                            "lines": [
+                                {
+                                    "id": line["id"],
+                                    "parts": [
+                                        {
+                                            "kind": "text",
+                                            "text": "For",
+                                            "atom_ids": [lookup["For"]],
+                                        },
+                                        {
+                                            "kind": "math",
+                                            "latex": r"xy \geq 0",
+                                            "atom_ids": [
+                                                lookup["xy"],
+                                                lookup["≥"],
+                                                lookup["0"],
+                                            ],
+                                        },
+                                        {
+                                            "kind": "text",
+                                            "text": "where",
+                                            "atom_ids": [lookup["where"]],
+                                        },
+                                    ],
+                                }
+                            ]
+                        }
+                    ]
+                }
+                partial = deepcopy(whole)
+                partial["cells"][0]["lines"][0]["parts"][1:2] = [
+                    {"kind": "text", "text": "xy", "atom_ids": [lookup["xy"]]},
+                    {
+                        "kind": "math",
+                        "latex": r"\geq 0",
+                        "atom_ids": [lookup["≥"], lookup["0"]],
+                    },
+                ]
+                schema = _table_schema(described, False, 1, 1)
+                with self.assertRaises(ValidationError):
+                    schema.model_validate(partial)
+                valid = schema.model_validate(whole).model_dump()
+                self.assertEqual(
+                    valid["cells"][0]["lines"][0]["parts"][1]["latex"], r"xy \geq 0"
+                )
+
+    def test_real_pdf_math_font_operand_repairs_to_complete_math_and_audit(self):
+        from marker.cloud.tables import LogicalTable, TablePart, recognize_table
+
+        with tempfile.TemporaryDirectory() as directory:
+            filename = Path(directory) / "math-font.pdf"
+            math_font_pdf(filename)
+            with PdfSource(filename) as source:
+                bbox = (15, 35, 140, 65)
+                grid = {
+                    "page": 0,
+                    "bbox": bbox,
+                    "trusted": False,
+                    "cells": [
+                        {"bbox": bbox, "source_page": 0, "atoms": source.page_words(0)}
+                    ],
+                }
+                table = LogicalTable(
+                    [TablePart(0, bbox, grid, source.page_size(0), source=source)], grid
+                )
+
+                def respond(s, n):
+                    cell = s["cells"][0]
+                    line = cell["lines"][0]
+                    ids = {a["text"]: a["id"] for a in line["atoms"]}
+                    parts = [{"kind": "text", "text": "For", "atom_ids": [ids["For"]]}]
+                    if n == 1:
+                        parts.extend(
+                            [
+                                {"kind": "text", "text": "xy", "atom_ids": [ids["xy"]]},
+                                {
+                                    "kind": "math",
+                                    "latex": r"\geq 0",
+                                    "atom_ids": [ids["≥"], ids["0"]],
+                                },
+                            ]
+                        )
+                    else:
+                        parts.append(
+                            {
+                                "kind": "math",
+                                "latex": r"xy \geq 0",
+                                "atom_ids": [ids["xy"], ids["≥"], ids["0"]],
+                            }
+                        )
+                    parts.append(
+                        {"kind": "text", "text": "where", "atom_ids": [ids["where"]]}
+                    )
+                    return {
+                        "cells": [
+                            {
+                                key: cell[key]
+                                for key in ("id", "row", "column", "rowspan", "colspan")
+                            }
+                            | {"lines": [{"id": line["id"], "parts": parts}]}
+                        ]
+                    }
+
+                client, _ = offline_client(respond, {"cloud_max_attempts": 2})
+                result = recognize_table(source, table, client)
+                self.assertTrue(result.complete, result.reasons)
+                self.assertEqual(client.request_count, 2)
+                soup = BeautifulSoup(result.html, "html.parser")
+                self.assertEqual(soup.find("annotation").text, r"xy \geq 0")
+                self.assertIn("For", soup.td.get_text())
+                self.assertIn("where", soup.td.get_text())
+                audit = next(
+                    image
+                    for name, image in result.resources.items()
+                    if name.startswith("formula")
+                )
+                self.assertGreater(
+                    audit.width,
+                    240,
+                    "Audit must include the xy operand from its actual PDF pixels",
+                )
 
     def test_png_output_preserves_alpha(self):
         pixels = Image.new("RGBA", (3, 2), (10, 20, 30, 0))
