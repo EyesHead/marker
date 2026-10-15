@@ -50,6 +50,7 @@ class OfflineProcesses:
         self.markdown = True
         self.fail_install = False
         self.emit_secret = False
+        self.write_secret = False
 
     def __call__(self, args, **kwargs):
         args = list(map(str, args))
@@ -73,6 +74,8 @@ class OfflineProcesses:
                     '<table><tr><td><img src="cell.png"></td><td>$\\varphi$</td></tr></table>', encoding="utf-8"
                 )
             (output / "cell.png").write_bytes(b"unchanged native image pixels")
+            if self.write_secret:
+                (output / "cell.png").write_bytes(b"accidental credential echo: " + KEY.encode())
             if self.metadata:
                 (output / (pdf.stem + "_meta.json")).write_text(json.dumps({"cloud_conversion": {
                     "status": self.status, "reasons": self.reasons, "requests": 2
@@ -323,6 +326,22 @@ class LauncherTests(unittest.TestCase):
         self.process.calls.clear()
         self.assertEqual(self.run_launcher()[0], 0)
         self.assertEqual(len(self.process.conversions()), 1)
+
+    def test_generated_resource_credential_echo_is_rejected_before_publication(self):
+        self.assertEqual(self.run_launcher()[0], 0)
+        target = self.note / (self.pdf.stem + ".md")
+        target.write_text("preserved previous result", encoding="utf-8")
+        original_image = (self.note / "cell.png").read_bytes()
+        self.process.write_secret = True
+        status, stdout, stderr = self.run_launcher(["--force"])
+        self.assertEqual(status, 1)
+        self.assertIn("credential", stderr.lower())
+        self.assertNotIn(KEY, stdout + stderr)
+        self.assertEqual(target.read_text(encoding="utf-8"), "preserved previous result")
+        self.assertEqual((self.note / "cell.png").read_bytes(), original_image)
+        for path in self.note.rglob("*"):
+            if path.is_file():
+                self.assertNotIn(KEY.encode(), path.read_bytes(), str(path))
 
     def test_missing_completion_metadata_cannot_replace_existing_note(self):
         self.assertEqual(self.run_launcher()[0], 0)

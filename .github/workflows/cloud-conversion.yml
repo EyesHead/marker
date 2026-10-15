@@ -1,0 +1,99 @@
+name: Cloud conversion
+
+on:
+  push:
+    branches: [master, 'codex/**']
+    paths:
+      - 'marker/**'
+      - 'Script*'
+      - 'tests/cloud/**'
+      - 'tests/html_tables/**'
+      - 'pyproject.toml'
+      - '.github/workflows/cloud-conversion.yml'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloud-conversion-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  portable:
+    name: Python 3.11 / ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONUTF8: '1'
+      HF_HUB_OFFLINE: '1'
+      TRANSFORMERS_OFFLINE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          enable-cache: true
+      - name: Create Python environment
+        run: uv venv --python 3.11
+      - name: Install CPU Torch on Linux and Windows
+        if: runner.os != 'macOS'
+        run: uv pip install 'torch>=2.7,<3' --index-url https://download.pytorch.org/whl/cpu
+      - name: Install Marker without downloading model weights
+        run: uv pip install --editable .
+      - name: Run cloud conversion fixtures
+        run: uv run --no-sync python -m unittest discover -s tests/cloud -v
+      - name: Run HTML table regressions
+        run: uv run --no-sync python -m unittest discover -s tests/html_tables -v
+      - name: Check launcher and CLI entry points
+        run: |
+          uv run --no-sync python ScriptOllama.py --help
+          uv run --no-sync python -m marker.scripts.convert_single --help
+
+  ubuntu25:
+    name: Python ${{ matrix.python }} / Ubuntu 25.10
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.13']
+    runs-on: ubuntu-24.04
+    container: ubuntu:25.10
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONUTF8: '1'
+      HF_HUB_OFFLINE: '1'
+      TRANSFORMERS_OFFLINE: '1'
+    steps:
+      - name: Prepare Ubuntu 25.10
+        run: |
+          # Ubuntu 25.10 is archived; use its matching release packages.
+          sed -i -E 's#https?://(archive|security).ubuntu.com/ubuntu/?#http://old-releases.ubuntu.com/ubuntu/#g' /etc/apt/sources.list.d/ubuntu.sources
+          apt-get update
+          apt-get install -y ca-certificates curl git
+          cat /etc/os-release
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          enable-cache: true
+      - name: Create portable Python environment
+        run: uv venv --python '${{ matrix.python }}'
+      - name: Install CPU Torch
+        run: uv pip install 'torch>=2.7,<3' --index-url https://download.pytorch.org/whl/cpu
+      - name: Install Marker without downloading model weights
+        run: uv pip install --editable .
+      - name: Run cloud and HTML fixtures
+        run: |
+          uv run --no-sync python -m unittest discover -s tests/cloud -v
+          uv run --no-sync python -m unittest discover -s tests/html_tables -v
+          uv run --no-sync python -m marker.scripts.convert_single --help
+          uv run --no-sync python ScriptOllama.py --help

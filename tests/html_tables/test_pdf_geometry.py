@@ -1,6 +1,6 @@
 """Regression checks against a local normative PDF; no cloud or model weights.
 
-Run with MARKER_SAMPLE_PDF=/path/to/СП_16.13330.2017_ollama_new.pdf.
+Run with MARKER_SAMPLE_PDF pointing to the local СП_16.13330.2017 sample.
 The user's PDF is intentionally not included in the repository.
 """
 import os
@@ -45,7 +45,8 @@ class SourcePDFGeometryTests(unittest.TestCase):
 
     def test_table_6_keeps_coefficient_column_images_and_merged_notes(self):
         document = self.make_document({17: [85.1, 163.58, 793.92, 455.62]})
-        TableProcessor(None, {'disable_ocr': True})(document)
+        with self.assertLogs('marker', level='INFO'):
+            TableProcessor(None, {'disable_ocr': True})(document)
         rendered = MarkdownRenderer()(document)
         soup = BeautifulSoup(rendered.markdown, 'html.parser')
         table = soup.find('table')
@@ -63,7 +64,8 @@ class SourcePDFGeometryTests(unittest.TestCase):
     def test_table_5_joins_interrupted_header_and_preserves_formula_cells(self):
         document = self.make_document({14: [85.1, 494.02, 786.96, 516.48],
                                        15: [85.1, 57.02, 786.96, 322.15]})
-        TableProcessor(None, {'disable_ocr': True})(document)
+        with self.assertLogs('marker', level='INFO'):
+            TableProcessor(None, {'disable_ocr': True})(document)
         merger = LLMTableMergeProcessor(Mock(return_value={'direction': 'bottom', 'merge': 'true'}),
                                         {'use_llm': True, 'disable_tqdm': True})
         merger.rewrite_blocks(document)
