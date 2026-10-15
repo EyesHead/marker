@@ -184,14 +184,18 @@ def analyze_page(source, page) -> list[Region]:
     for item in [*source.pdf_page(page).edges, *source.pdf_page(page).curves]:
         box = object_bbox(item)
         if any(all(region.bbox[i]-1 <= box[i] for i in (0, 1)) and
-               all(box[i] <= region.bbox[i]+1 for i in (2, 3)) for region in regions):
+               all(box[i] <= region.bbox[i]+1 for i in (2, 3))
+               for region in regions if region.kind in ("table", "image")):
             continue
+        source_box = box
         box = (max(0, box[0]-0.5), max(0, box[1]-0.5),
                min(width, box[2]+0.5), min(height, box[3]+0.5))
-        if not covered(box):
-            graphics.append({"kind": "vector", "bbox": box, "source_bbox": box, "source_page": page})
+        area = (box[2]-box[0])*(box[3]-box[1])
+        if not any(intersection(box, region.bbox) >= area*0.8
+                   for region in regions if region.kind in ("table", "image")):
+            graphics.append({"kind": "vector", "bbox": source_box, "source_bbox": source_box, "source_page": page, "crop_bbox": box})
     if graphics:
-        box = _bounds(graphics)
+        box = _bounds([dict(atom, bbox=atom["crop_bbox"]) for atom in graphics])
         regions.append(Region(page, box, "unknown", tuple(graphics), source.text_quality(page, box)))
     if not regions:
         box = (0.0, 0.0, width, height)

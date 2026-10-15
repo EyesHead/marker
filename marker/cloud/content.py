@@ -95,6 +95,8 @@ def source_lines(atoms):
 
 
 def math_required(atoms):
+    if any(a.get("content_kind") == "math" for a in atoms):
+        return True
     text = " ".join(a.get("text", "") for a in atoms)
     if re.search(r"[=<>≤≥≠±∑∏∫√∞∂]|\\[A-Za-z]+|[α-ωΑ-Ωϕϑϱ]", text):
         return True
@@ -136,6 +138,8 @@ def expression_groups(atoms):
     )
 
     def member(atom):
+        if atom.get("content_kind") == "math":
+            return True
         if atom.get("kind") == "image":
             box = atom["bbox"]
             return box[2] - box[0] <= 24 and box[3] - box[1] <= 24
@@ -296,7 +300,7 @@ class RegionResponse(BaseModel):
         return self
 
 
-def recognize_region(source, region, client):
+def recognize_region(source, region, client, *, allow_text=True):
     """Return content/resources/status without hiding required recognition loss."""
     identities = tuple(atom_id(a, region.page) for a in region.atoms)
     if not region.required:
@@ -324,6 +328,7 @@ def recognize_region(source, region, client):
             "page": region.page,
             "bbox": region.bbox,
             "required_kind": region.kind,
+            "allow_text": allow_text,
             "atoms": [
                 {
                     "id": atom_id(a, region.page),
@@ -342,9 +347,17 @@ def recognize_region(source, region, client):
             + json.dumps(payload, ensure_ascii=False)
         )
 
+        if not allow_text:
+            prompt += (
+                "\nOrdinary text OCR is disabled. Classify text as unresolved "
+                "without transcribing it; only math/figure recognition is allowed."
+            )
+
         class RequiredRegionResponse(RegionResponse):
             @model_validator(mode="after")
             def required_kind(self):
+                if not allow_text and self.kind == "text":
+                    raise ValueError("Required text OCR is disabled")
                 if region.kind == "math" and self.kind != "math":
                     raise ValueError("Required expression must be math")
                 return self

@@ -23,11 +23,15 @@ logger = get_logger()
 @click.argument("fpath", type=str)
 @ConfigParser.common_options
 def convert_single_cli(fpath: str, **kwargs):
-    models = create_model_dict()
     start = time.time()
     config_parser = ConfigParser(kwargs)
 
     converter_cls = config_parser.get_converter_cls()
+    models = (
+        create_model_dict()
+        if getattr(converter_cls, "requires_model_dict", True)
+        else {}
+    )
     converter = converter_cls(
         config=config_parser.generate_config_dict(),
         artifact_dict=models,
@@ -41,3 +45,12 @@ def convert_single_cli(fpath: str, **kwargs):
 
     logger.info(f"Saved markdown to {out_folder}")
     logger.info(f"Total time: {time.time() - start}")
+
+    if not getattr(converter_cls, "requires_model_dict", True):
+        status = rendered.metadata.get("cloud_conversion", {}).get("status")
+        if status != "complete":
+            raise click.exceptions.Exit(1)
+
+
+if __name__ == "__main__":
+    convert_single_cli()
