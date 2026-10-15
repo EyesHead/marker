@@ -137,10 +137,27 @@ def expression_groups(atoms):
         ),
         default=10,
     )
+    ordered = sorted(atoms, key=lambda a: a["bbox"][0])
+    # A selectable prose conjunction between two raster expressions is not
+    # an operand. In particular, Russian «и» otherwise looks like a one-letter
+    # variable. Explicit mathematical metadata still takes precedence.
+    prose_connectives = {
+        id(atom)
+        for index, atom in enumerate(ordered)
+        if 0 < index < len(ordered) - 1
+        and atom.get("kind", "text") == "text"
+        and atom.get("text", "").strip().casefold() in ("и", "and", "or")
+        and not atom.get("italic")
+        and not re.search(r"math|symbol|cmmi|cmsy", atom.get("fontname", ""), re.I)
+        and ordered[index - 1].get("kind") == "image"
+        and ordered[index + 1].get("kind") == "image"
+    }
 
     def member(atom):
         if atom.get("content_kind") == "math":
             return True
+        if id(atom) in prose_connectives:
+            return False
         if atom.get("kind") == "image":
             box = atom["bbox"]
             return box[2] - box[0] <= 24 and box[3] - box[1] <= 24
@@ -176,7 +193,7 @@ def expression_groups(atoms):
     current = []
     bracket_depth = 0
     opening_tail = None
-    for atom in sorted(atoms, key=lambda a: a["bbox"][0]):
+    for atom in ordered:
         text = atom.get("text", "").rstrip()
         if not member(atom) and not (bracket_depth and text in (",", ";", ":")):
             # A prose word disproves an unfinished parenthetical math tail.

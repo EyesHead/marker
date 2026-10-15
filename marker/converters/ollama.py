@@ -125,7 +125,12 @@ def scan_layout(source, region, client):
     for item in response["regions"]:
         box = tuple(item["bbox"])
         if item["kind"] == "decoration":
-            continue
+            # The assigned image is required source content. A model's
+            # decoration label cannot prove its pixels safe to discard.
+            # Let the caller retain the complete source with incomplete status.
+            raise RecognitionFailure(
+                "Required source image was classified as decoration"
+            )
         grid = None
         atoms = []
         if item["kind"] == "table":

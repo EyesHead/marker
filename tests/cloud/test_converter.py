@@ -313,6 +313,31 @@ class AdaptiveConverterTests(unittest.TestCase):
         self.assertEqual(len(vectors), 2)
         self.assertTrue(all(a["bbox"][1] == a["bbox"][3] for a in vectors))
 
+    def test_decoration_classification_keeps_required_native_image_incomplete(self):
+        from marker.cloud.source import PdfSource
+
+        def decoration(source, attempt):
+            if source.get("stage") == "layout":
+                return {
+                    "complete": True,
+                    "regions": [
+                        {"kind": "decoration", "bbox": source["bbox"], "cells": []}
+                    ],
+                }
+            return respond(source, attempt)
+
+        output, _ = self.convert("native_figure.pdf", responder=decoration)
+        self.assertEqual(output.metadata["cloud_conversion"]["status"], "incomplete")
+        self.assertTrue(output.metadata["cloud_conversion"]["reasons"])
+        with PdfSource(FIXTURES / "native_figure.pdf") as source:
+            original = source.extract_image(source.page_images(0)[0])
+        retained = [
+            image for image in output.images.values() if image.size == (2048, 1024)
+        ]
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(retained[0].tobytes(), original.tobytes())
+        self.assertIn("![Unresolved source]", output.markdown)
+
     def test_formula_and_table_content_share_one_counter(self):
         output, observed = self.convert("split_formula.pdf")
         self.assertEqual(output.metadata["cloud_conversion"]["status"], "complete")

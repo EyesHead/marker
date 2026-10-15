@@ -870,6 +870,71 @@ class ContentTests(unittest.TestCase):
             [["x", "2", "≥", "0"], ["α", "1", "=", "1,5"]],
         )
 
+    def test_raster_symbols_separated_by_prose_keep_independent_math_owners(self):
+        from marker.cloud.content import atom_id, expression_groups
+        from marker.cloud.tables import _describe_cells, _table_schema
+        from marker.processors.table_geometry import grid_positions
+
+        for connective in ("и", "and", "or"):
+            for hinted in (False, True):
+                with self.subTest(connective=connective, hinted=hinted):
+                    # These are the source roles in «α₂ и β», including the
+                    # selectable conjunction between two independent rasters.
+                    atoms = [
+                        {"kind": "image", "bbox": (0, 0, 15, 17), "image_index": 0},
+                        {
+                            "kind": "text", "text": connective, "size": 9,
+                            "fontname": "TimesNewRoman", "bbox": (16, 5, 30, 14),
+                        },
+                        {"kind": "image", "bbox": (32, 0, 42, 17), "image_index": 1},
+                    ]
+                    if hinted:
+                        for atom in (atoms[0], atoms[2]):
+                            atom["content_kind"] = "math"
+                    groups = expression_groups(atoms)
+                    self.assertFalse(any(atoms[1] in group for group in groups))
+                    if hinted:
+                        self.assertEqual(groups, [[atoms[0]], [atoms[2]]])
+                    grid = {
+                        "page": 0,
+                        "cells": [{"bbox": (0, 0, 50, 20), "atoms": atoms}],
+                    }
+                    xs, ys, positions = grid_positions(grid)
+                    described, _ = _describe_cells(grid, positions)
+                    cell = described[0]
+                    parts = [
+                        {
+                            "kind": "math", "atom_ids": [atom_id(atoms[0], 0)],
+                            "latex": r"\alpha_2",
+                        },
+                        {
+                            "kind": "text", "atom_ids": [atom_id(atoms[1], 0)],
+                            "text": connective,
+                        },
+                        {
+                            "kind": "math", "atom_ids": [atom_id(atoms[2], 0)],
+                            "latex": r"\beta",
+                        },
+                    ]
+                    response_cell = {
+                        key: cell[key]
+                        for key in ("id", "row", "column", "rowspan", "colspan")
+                    }
+                    response_cell["lines"] = [{"id": "c0l0", "parts": parts}]
+                    schema = _table_schema(
+                        described, True, len(ys) - 1, len(xs) - 1
+                    )
+                    schema.model_validate({"cells": [response_cell]})
+
+    def test_wide_known_math_raster_and_unhinted_diagram_keep_distinct_roles(self):
+        from marker.cloud.content import expression_groups
+
+        equation = {
+            "kind": "image", "content_kind": "math", "bbox": (0, 0, 80, 18)
+        }
+        diagram = {"kind": "image", "bbox": (100, 0, 200, 60)}
+        self.assertEqual(expression_groups([equation, diagram]), [[equation]])
+
     def test_table_subscript_split_requires_counted_complete_expression_repair(self):
         self.content()
         from marker.cloud.tables import recognize_table
