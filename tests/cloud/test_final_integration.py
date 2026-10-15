@@ -45,7 +45,11 @@ def simple_pdf(path, sentence=None, raster=False, inline_raster=False, overlay=F
         else b"BT /F1 10 Tf 10 50 Td (" + sentence.encode() + b") Tj ET"
     )
     if inline_raster:
-        stream = b"BT /F1 10 Tf 10 50 Td (If) Tj 15 0 Td (x) Tj ET q 12 0 0 12 35 45 cm /Im Do Q BT /F1 10 Tf 50 50 Td (0, then accepted) Tj ET"
+        stream = (
+            b"BT /F1 10 Tf 10 50 Td (If) Tj 15 0 Td (x) Tj ET q 12 0 0 12 35 45 cm /Im Do Q BT /F1 10 Tf 50 50 Td ("
+            + (sentence or "0, then accepted").encode()
+            + b") Tj ET"
+        )
     if overlay:
         stream += b" BT /F1 10 Tf 30 40 Td (x = 0) Tj ET"
     objects = [
@@ -139,6 +143,143 @@ class FinalIntegrationTests(unittest.TestCase):
                 [[a["text"] for a in s["atoms"]] for s in observed],
                 [["x", "=", "0,"], ["y", "=", "1,"]],
             )
+
+    def test_attached_delimiters_keep_single_letter_prose_and_expression_owners(self):
+        for separator in (",", ";", ":"):
+            for sentence, latex, expected, owners in (
+                (
+                    f"When x = 0{separator} I agree",
+                    ["x = 0"],
+                    f"When $x = 0${separator} I agree",
+                    [["x", "=", f"0{separator}"]],
+                ),
+                (
+                    f"If x = 0{separator} y = 1{separator} accepted",
+                    ["x = 0", "y = 1"],
+                    f"If $x = 0${separator} $y = 1${separator} accepted",
+                    [["x", "=", f"0{separator}"], ["y", "=", f"1{separator}"]],
+                ),
+            ):
+                with (
+                    self.subTest(sentence=sentence),
+                    tempfile.TemporaryDirectory() as directory,
+                ):
+                    filename = Path(directory) / "punctuation.pdf"
+                    simple_pdf(filename, sentence)
+                    client, observed = offline_client(
+                        lambda s, n: {
+                            "kind": "math",
+                            "resolved": True,
+                            "latex": latex[n - 1],
+                        }
+                    )
+                    output = OllamaPdfConverter(artifact_dict={"cloud_client": client})(
+                        filename
+                    )
+                    self.assertEqual(
+                        output.metadata["cloud_conversion"]["status"], "complete"
+                    )
+                    self.assertEqual(output.markdown, expected)
+                    self.assertEqual(
+                        [[a["text"] for a in s["atoms"]] for s in observed], owners
+                    )
+                    self.assertEqual(client.request_count, len(owners))
+
+    def test_decimal_commas_remain_inside_math_and_sentence_punctuation_occurs_once(
+        self,
+    ):
+        for separator in (",", ";", ":"):
+            for recognized_separator in ("", separator):
+                with (
+                    self.subTest(separator=separator, recognized=recognized_separator),
+                    tempfile.TemporaryDirectory() as directory,
+                ):
+                    filename = Path(directory) / "decimal-comma.pdf"
+                    simple_pdf(filename, f"When x = 0,5{separator} I agree")
+                    latex = "x = 0,5" + recognized_separator
+                    client, observed = offline_client(
+                        lambda s, n: {"kind": "math", "resolved": True, "latex": latex}
+                    )
+                    output = OllamaPdfConverter(artifact_dict={"cloud_client": client})(
+                        filename
+                    )
+                    expected = (
+                        f"When ${latex}$"
+                        + ("" if recognized_separator else separator)
+                        + " I agree"
+                    )
+                    self.assertEqual(
+                        output.metadata["cloud_conversion"]["status"], "complete"
+                    )
+                    self.assertEqual(output.markdown, expected)
+                    self.assertEqual(
+                        [a["text"] for a in observed[0]["atoms"]],
+                        ["x", "=", f"0,5{separator}"],
+                    )
+                    self.assertEqual(client.request_count, 1)
+
+    def test_raster_operator_attached_delimiter_keeps_single_letter_prose(self):
+        for separator in (",", ";", ":"):
+            with (
+                self.subTest(separator=separator),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                filename = Path(directory) / "raster-punctuation.pdf"
+                simple_pdf(
+                    filename, sentence=f"0{separator} I agree", inline_raster=True
+                )
+                client, observed = offline_client(
+                    lambda s, n: {
+                        "kind": "math",
+                        "resolved": True,
+                        "latex": r"x \geq 0",
+                    }
+                )
+                output = OllamaPdfConverter(artifact_dict={"cloud_client": client})(
+                    filename
+                )
+                self.assertEqual(
+                    output.metadata["cloud_conversion"]["status"], "complete"
+                )
+                self.assertEqual(
+                    output.markdown, r"If $x \geq 0$" + separator + " I agree"
+                )
+                self.assertEqual(
+                    [a["text"] for a in observed[0]["atoms"] if a["kind"] == "text"],
+                    ["x", f"0{separator}"],
+                )
+                self.assertEqual(
+                    [a["kind"] for a in observed[0]["atoms"]], ["text", "image", "text"]
+                )
+
+    def test_math_font_attached_delimiter_keeps_single_letter_prose(self):
+        for separator in (",", ";", ":"):
+            with (
+                self.subTest(separator=separator),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                filename = Path(directory) / "font-punctuation.pdf"
+                math_font_pdf(filename, separator=separator, suffix="I agree")
+                client, observed = offline_client(
+                    lambda s, n: {
+                        "kind": "math",
+                        "resolved": True,
+                        "latex": r"xy \geq 0",
+                    }
+                )
+                output = OllamaPdfConverter(artifact_dict={"cloud_client": client})(
+                    filename
+                )
+                self.assertEqual(
+                    output.metadata["cloud_conversion"]["status"], "complete"
+                )
+                self.assertEqual(
+                    output.markdown, r"For $xy \geq 0$" + separator + " I agree"
+                )
+                self.assertEqual(
+                    [a["text"] for a in observed[0]["atoms"]],
+                    ["xy", "≥", f"0{separator}"],
+                )
 
     def test_sentence_math_font_operand_keeps_prose_and_inline_order(self):
         with tempfile.TemporaryDirectory() as directory:

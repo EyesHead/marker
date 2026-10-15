@@ -149,6 +149,9 @@ def expression_groups(atoms):
         text = atom.get("text", "").strip()
         if not text or text in (",", ";", ":"):
             return False
+        # Attached sentence separators delimit owners, not the last operand.
+        # Internal decimal commas (0,5) remain part of the mathematical token.
+        text = text.rstrip(",;:")
         if re.search(r"[=<>≤≥≠±∑∏∫√∞∂α-ωΑ-Ωϕϑϱ]|\\[A-Za-z]+", text):
             return True
         if re.fullmatch(r"[+−*/^_()\[\]{}-]+", text):
@@ -180,6 +183,9 @@ def expression_groups(atoms):
             runs.append(current)
             current = []
         current.append(atom)
+        if atom.get("text", "").rstrip().endswith((",", ";", ":")):
+            runs.append(current)
+            current = []
     if current:
         runs.append(current)
     return [run for run in runs if math_required(run)]
