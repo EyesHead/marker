@@ -185,6 +185,105 @@ class FinalIntegrationTests(unittest.TestCase):
                     )
                     self.assertEqual(client.request_count, len(owners))
 
+    def test_bracketed_expression_owns_internal_separators_and_nested_operands(self):
+        from copy import deepcopy
+        from marker.cloud.content import group_expression_regions
+        from marker.cloud.regions import analyze_page
+
+        cases = [
+            (
+                "For x = [ 0, 1 ] accepted",
+                "x = [0,1]",
+                ["x", "=", "[", "0,", "1", "]"],
+            ),
+            (
+                "For x = [ ( 0, 1 ) ; { 2 : 3 } ] accepted",
+                r"x = [(0,1); \{2:3\}]",
+                ["x", "=", "[", "(", "0,", "1", ")", ";", "{", "2", ":", "3", "}", "]"],
+            ),
+        ]
+        for sentence, latex, owner in cases:
+            with (
+                self.subTest(sentence=sentence),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                filename = Path(directory) / "bracketed-expression.pdf"
+                simple_pdf(filename, sentence)
+                with PdfSource(filename) as source:
+                    regions = analyze_page(source, 0)
+                    original = deepcopy([r.atoms for r in regions])
+                    grouped = group_expression_regions(regions)
+                    self.assertEqual([r.atoms for r in regions], original)
+                    self.assertEqual(
+                        [
+                            [a["text"] for a in r.atoms]
+                            for r in grouped
+                            if r.kind == "math"
+                        ],
+                        [owner],
+                    )
+                client, observed = offline_client(
+                    lambda s, n: {"kind": "math", "resolved": True, "latex": latex}
+                )
+                output = OllamaPdfConverter(artifact_dict={"cloud_client": client})(
+                    filename
+                )
+                self.assertEqual(
+                    output.metadata["cloud_conversion"]["status"], "complete"
+                )
+                self.assertEqual(output.markdown, f"For ${latex}$ accepted")
+                self.assertEqual(
+                    [[a["text"] for a in s["atoms"]] for s in observed], [owner]
+                )
+                self.assertEqual(client.request_count, 1)
+
+    def test_closing_bracket_separator_ends_owner_before_prose_or_next_expression(self):
+        cases = [
+            (
+                "When x = [ 0, 1 ], I agree",
+                ["x = [0,1]"],
+                "When $x = [0,1]$, I agree",
+                [["x", "=", "[", "0,", "1", "],"]],
+            ),
+            (
+                "When x = ( 0; 1 ): I agree",
+                ["x = (0;1)"],
+                "When $x = (0;1)$: I agree",
+                [["x", "=", "(", "0;", "1", "):"]],
+            ),
+            (
+                "When x = [0,5; 1], y = {2: 3}; I agree",
+                ["x = [0,5;1]", r"y = \{2:3\}"],
+                r"When $x = [0,5;1]$, $y = \{2:3\}$; I agree",
+                [["x", "=", "[0,5;", "1],"], ["y", "=", "{2:", "3};"]],
+            ),
+        ]
+        for sentence, latex, expected, owners in cases:
+            with (
+                self.subTest(sentence=sentence),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                filename = Path(directory) / "closed-bracket.pdf"
+                simple_pdf(filename, sentence)
+                client, observed = offline_client(
+                    lambda s, n: {
+                        "kind": "math",
+                        "resolved": True,
+                        "latex": latex[n - 1],
+                    }
+                )
+                output = OllamaPdfConverter(artifact_dict={"cloud_client": client})(
+                    filename
+                )
+                self.assertEqual(
+                    output.metadata["cloud_conversion"]["status"], "complete"
+                )
+                self.assertEqual(output.markdown, expected)
+                self.assertEqual(
+                    [[a["text"] for a in s["atoms"]] for s in observed], owners
+                )
+                self.assertEqual(client.request_count, len(owners))
+
     def test_decimal_commas_remain_inside_math_and_sentence_punctuation_occurs_once(
         self,
     ):

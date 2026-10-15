@@ -156,6 +156,7 @@ def expression_groups(atoms):
             return True
         if re.fullmatch(r"[+−*/^_()\[\]{}-]+", text):
             return True
+        text = text.strip("()[]{}")
         if re.fullmatch(r"[+-]?\d+(?:[.,]\d+)*[,;]?", text):
             return True
         if re.fullmatch(r"[A-Za-zА-Яа-я]", text):
@@ -173,17 +174,28 @@ def expression_groups(atoms):
 
     runs = []
     current = []
+    bracket_depth = 0
     for atom in sorted(atoms, key=lambda a: a["bbox"][0]):
-        if not member(atom):
+        text = atom.get("text", "").rstrip()
+        if not member(atom) and not (bracket_depth and text in (",", ";", ":")):
             if current:
                 runs.append(current)
                 current = []
+            bracket_depth = 0
             continue
         if current and atom["bbox"][0] - current[-1]["bbox"][2] > 16:
             runs.append(current)
             current = []
+            bracket_depth = 0
         current.append(atom)
-        if atom.get("text", "").rstrip().endswith((",", ";", ":")):
+        # Bracketed intervals/arguments own internal separators, including
+        # standalone punctuation atoms. Closing punctuation still ends a run.
+        for character in text:
+            if character in "([{":
+                bracket_depth += 1
+            elif character in ")]}":
+                bracket_depth = max(0, bracket_depth - 1)
+        if not bracket_depth and text.endswith((",", ";", ":")):
             runs.append(current)
             current = []
     if current:
