@@ -611,7 +611,20 @@ def _validate_final_structure(recognized, rows, columns):
 
 
 def _render_recognized_table(source, described, originals, recognized, resources, grid):
-    html = ["<table><tbody>"]
+    xs, _, _ = grid_positions(grid)
+    width = xs[-1] - xs[0]
+    # Absolutely placed source lines contribute no intrinsic table width.
+    # Carry the physical column canvas into the HTML itself, independently of
+    # the host application's table padding/font/minimum-width defaults.
+    html = [
+        f'<table style="table-layout:fixed;border-collapse:collapse;width:{width:.3f}pt;'
+        f'min-width:{width:.3f}pt;max-width:none"><colgroup>'
+    ]
+    html.extend(
+        f'<col style="width:{right-left:.3f}pt">'
+        for left, right in zip(xs, xs[1:])
+    )
+    html.append("</colgroup><tbody>")
     source_by_id = {cell["id"]: cell for cell in described}
     cells_by_row = {}
     for cell in recognized.values():
@@ -624,28 +637,41 @@ def _render_recognized_table(source, described, originals, recognized, resources
             attrs = (f' rowspan="{cell["rowspan"]}"' if cell["rowspan"] > 1 else "") + (
                 f' colspan="{cell["colspan"]}"' if cell["colspan"] > 1 else ""
             )
-            html.append(f"<td{attrs}>")
+            html.append(f'<td{attrs} style="padding:0;vertical-align:top">')
             original = originals[cell["id"]]
             expected_lines = {
                 line["id"]: line for line in source_by_id[cell["id"]]["lines"]
             }
             responses = {line["id"]: line for line in cell["lines"]}
             cell_layout = original.get("layout_bbox", original["bbox"])
+            cell_width = xs[cell["column"] + cell["colspan"]] - xs[cell["column"]]
             html.append(
-                f'<div style="position:relative;height:{cell_layout[3]-cell_layout[1]:.3f}pt">'
+                f'<div style="position:relative;min-width:{cell_width:.3f}pt;'
+                f'height:{cell_layout[3]-cell_layout[1]:.3f}pt">'
             )
+            atom_lookup = {
+                atom_id(a, a.get("source_page", grid["page"])): a
+                for a in original["atoms"]
+            }
             for identity, line in expected_lines.items():
                 result = responses[identity]
+                line_atoms = [atom_lookup[atom["id"]] for atom in line["atoms"]]
+                line_layout = bounds(line_atoms, layout=True)
+                default_size = max(6, min(12, line["bbox"][3] - line["bbox"][1]))
+                font_size = max(
+                    (atom.get("size", default_size) for atom in line_atoms
+                     if atom.get("kind", "text") == "text"),
+                    default=default_size,
+                )
                 # Absolute source baseline placement preserves correspondence
                 # even when physical cells have no internal horizontal rules.
                 html.append(
                     f'<div data-source-line="{identity}" data-source-page="{line["page"]}" '
-                    f'data-source-y="{line["bbox"][1]:.3f}" style="position:absolute;top:{line["layout_y"]-cell_layout[1]:.3f}pt;white-space:nowrap">'
+                    f'data-source-y="{line["bbox"][1]:.3f}" style="position:absolute;'
+                    f'left:{line_layout[0]-cell_layout[0]:.3f}pt;'
+                    f'top:{line["layout_y"]-cell_layout[1]:.3f}pt;'
+                    f'font-size:{font_size:.3f}pt;line-height:1;white-space:nowrap">'
                 )
-                atom_lookup = {
-                    atom_id(a, a.get("source_page", grid["page"])): a
-                    for a in original["atoms"]
-                }
                 for part in result["parts"]:
                     atoms = [atom_lookup[identity] for identity in part["atom_ids"]]
                     if part["kind"] == "math":

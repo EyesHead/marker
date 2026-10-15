@@ -981,6 +981,46 @@ class ContentTests(unittest.TestCase):
             "Combining independent expressions and prose must require repair",
         )
 
+    def test_table_source_width_fonts_and_horizontal_offsets_are_intrinsic(self):
+        self.content()
+        from marker.cloud.tables import recognize_table
+
+        with PdfSource(FIXTURES / "content_lines.pdf") as source:
+            table = group_tables(detect_tables(source), None)[0]
+            client, _ = offline_client(table_echo)
+            result = recognize_table(source, table, client)
+            self.assertTrue(result.complete, result.reasons)
+            soup = BeautifulSoup(result.html, "html.parser")
+            self.assertIsNotNone(
+                soup.find("colgroup"),
+                "Absolute children need intrinsic physical column widths",
+            )
+            self.assertEqual(
+                [col["style"] for col in soup.find_all("col")], ["width:74.000pt"] * 7
+            )
+            self.assertIn("width:518.000pt", soup.table["style"])
+            self.assertIn("min-width:518.000pt", soup.table["style"])
+            header = soup.find("td")
+            self.assertIn("padding:0", header["style"])
+            line = header.find(attrs={"data-source-line": True})
+            self.assertIn("font-size:10.000pt", line["style"])
+            self.assertIn("left:8.000pt", line["style"])
+            self.assertIn("top:8.070pt", line["style"])
+            self.assertEqual(line.get_text(strip=True), "Coefficient")
+            cell = header.find("div", recursive=False)
+            self.assertIn("min-width:74.000pt", cell["style"])
+        with PdfSource(FIXTURES / "refined_header.pdf") as source:
+            table = group_tables(detect_tables(source), None)[0]
+            client, _ = offline_client(table_echo)
+            result = recognize_table(source, table, client)
+            self.assertTrue(result.complete, result.reasons)
+            soup = BeautifulSoup(result.html, "html.parser")
+            merged = soup.find("td", colspan="2")
+            self.assertIsNotNone(merged)
+            self.assertIn(
+                "min-width:200.000pt", merged.find("div", recursive=False)["style"]
+            )
+
     def test_png_output_preserves_alpha(self):
         pixels = Image.new("RGBA", (3, 2), (10, 20, 30, 0))
         pixels.putpixel((1, 1), (40, 50, 60, 127))
