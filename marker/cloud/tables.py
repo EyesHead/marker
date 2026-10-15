@@ -10,7 +10,7 @@ from statistics import median
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from marker.cloud.client import schema_prompt
+from marker.cloud.client import schema_prompt, semantic_error
 from marker.cloud.content import (
     ContentResult, atom_id, bounds, context_box, expression_groups, latex_to_mathml,
     resource_name, source_lines,
@@ -280,7 +280,7 @@ class TableSegment(BaseModel):
             try:
                 latex_to_mathml(self.latex)
             except RecognitionFailure:
-                raise ValueError("Required math is unresolved or unsupported") from None
+                raise semantic_error("math_unsupported") from None
         return self
 
 
@@ -313,7 +313,7 @@ def _table_schema(expected, trusted, row_count, column_count):
             if len(self.cells) != len(expected_by_id) or {
                 cell.id for cell in self.cells
             } != set(expected_by_id):
-                raise ValueError("Cell IDs must cover assigned cells once")
+                raise semantic_error("table_cell_ownership")
             occupied = set()
             for cell in self.cells:
                 original = expected_by_id[cell.id]
@@ -321,25 +321,25 @@ def _table_schema(expected, trusted, row_count, column_count):
                     getattr(cell, key) != original[key]
                     for key in ("row", "column", "rowspan", "colspan")
                 ):
-                    raise ValueError("Trusted physical spans cannot change")
+                    raise semantic_error("table_trusted_spans")
                 if (
                     cell.row + cell.rowspan > row_count
                     or cell.column + cell.colspan > column_count
                 ):
-                    raise ValueError("Cell span exceeds table extent")
+                    raise semantic_error("table_span_bounds")
                 slots = {
                     (r, c)
                     for r in range(cell.row, cell.row + cell.rowspan)
                     for c in range(cell.column, cell.column + cell.colspan)
                 }
                 if occupied.intersection(slots):
-                    raise ValueError("Cell spans overlap")
+                    raise semantic_error("table_span_overlap")
                 occupied.update(slots)
                 expected_lines = {line["id"]: line for line in original["lines"]}
                 if len(cell.lines) != len(expected_lines) or {
                     line.id for line in cell.lines
                 } != set(expected_lines):
-                    raise ValueError("Source baseline lines must be covered once")
+                    raise semantic_error("table_line_ownership")
                 for line in cell.lines:
                     source_line = expected_lines[line.id]
                     atoms = {atom["id"]: atom for atom in source_line["atoms"]}
@@ -347,7 +347,7 @@ def _table_schema(expected, trusted, row_count, column_count):
                         identity for part in line.parts for identity in part.atom_ids
                     ]
                     if len(consumed) != len(atoms) or set(consumed) != set(atoms):
-                        raise ValueError("Line source atoms must be owned exactly once")
+                        raise semantic_error("table_atom_ownership")
                     for group in source_line["expression_groups"]:
                         # Coverage alone permits text x + isolated math ≥ +
                         # text 0. Every source expression must instead have
@@ -360,25 +360,21 @@ def _table_schema(expected, trusted, row_count, column_count):
                             len(owners) != 1 or owners[0].kind != "math"
                             or set(owners[0].atom_ids) != set(group)
                         ):
-                            raise ValueError(
-                                "Complete source expression must have one math owner"
-                            )
+                            raise semantic_error("table_complete_expression")
                     for part in line.parts:
                         if not part.atom_ids:
-                            raise ValueError("Output content has no source ownership")
+                            raise semantic_error("table_content_ownership")
                         owned = [atoms[identity] for identity in part.atom_ids]
                         if part.kind == "figure" and any(
                             a["kind"] not in ("image", "vector", "unknown")
                             for a in owned
                         ):
-                            raise ValueError(
-                                "Selectable text cannot disappear into a figure"
-                            )
+                            raise semantic_error("table_selectable_text_figure")
                         if part.kind == "text":
                             # Grid trust describes physical geometry. Raster
                             # ordinary text can need OCR even in ruled cells.
                             if not part.text.strip():
-                                raise ValueError("Required text remains unresolved")
+                                raise semantic_error("table_text_unresolved")
             return self
 
     return TableResponse
@@ -486,6 +482,18 @@ def _window_images(source, cells, originals, headers, maximum):
             )
         )
     return images
+
+
+def _owned_cells(units):
+    """Reassemble disjoint line units without changing IDs, source boxes or spans."""
+    cells = {}
+    for cell, line in units:
+        owned = cells.setdefault(cell["id"], {
+            key: cell[key] for key in ("id", "row", "column", "rowspan", "colspan")
+        } | {"lines": []})
+        if line is not None:
+            owned["lines"].append(line)
+    return list(cells.values())
 
 
 def _table_windows(source, described, originals, client, trusted, rows, columns):
@@ -680,7 +688,7 @@ def _render_recognized_table(source, described, originals, recognized, resources
                         name = resource_name(
                             "formula", page, box, tuple(part["atom_ids"])
                         )
-                        resources[name] = source.crop(page, box)
+                        resources[name] = source.resource(page, box)
                         html.append(latex_to_mathml(part["latex"]))
                     elif part["kind"] == "figure":
                         box = bounds(atoms)
@@ -729,29 +737,47 @@ def recognize_table(source, logical_table, client):
         for cells, prompt, images, schema in _table_windows(
             source, described, originals, client, trusted, rows, columns
         ):
-            try:
-                result = client.request(prompt, images, schema)
-            except RecognitionFailure:
-                for cell in cells:
-                    for line in cell["lines"]:
-                        name = resource_name(
-                            "unresolved-table", line["page"], line["bbox"], line["id"]
-                        )
-                        resources[name] = source.crop(line["page"], line["bbox"])
-                raise
-            for cell in result["cells"]:
-                if cell["id"] in recognized:
-                    previous = recognized[cell["id"]]
-                    if any(
-                        previous[key] != cell[key]
-                        for key in ("row", "column", "rowspan", "colspan")
-                    ):
-                        raise RecognitionFailure(
-                            "Split cell structure changed between windows"
-                        )
-                    previous["lines"].extend(cell["lines"])
-                else:
-                    recognized[cell["id"]] = cell
+            # A server may enforce a smaller context than the conservative
+            # client estimate. Keep reflowed ownership in the same counted
+            # request; only successful disjoint remainders get a new request.
+            units = [(cell, line) for cell in cells for line in (cell["lines"] or [None])]
+            while units:
+                remaining = []
+
+                def reflow():
+                    nonlocal units, remaining
+                    if len(units) <= 1:
+                        return None
+                    midpoint = len(units) // 2
+                    remaining = units[midpoint:] + remaining
+                    units = units[:midpoint]
+                    reduced_cells = _owned_cells(units)
+                    return (
+                        _window_prompt(reduced_cells, [], trusted, rows, columns),
+                        _window_images(source, reduced_cells, originals, [], client.cloud_max_images),
+                        _table_schema(reduced_cells, trusted, rows, columns),
+                    )
+
+                result = client.request(prompt, images, schema, context_reflow=reflow)
+                for cell in result["cells"]:
+                    if cell["id"] in recognized:
+                        previous = recognized[cell["id"]]
+                        if any(
+                            previous[key] != cell[key]
+                            for key in ("row", "column", "rowspan", "colspan")
+                        ):
+                            raise RecognitionFailure(
+                                "Split cell structure changed between windows"
+                            )
+                        previous["lines"].extend(cell["lines"])
+                    else:
+                        recognized[cell["id"]] = cell
+                units = remaining
+                if units:
+                    pending_cells = _owned_cells(units)
+                    prompt = _window_prompt(pending_cells, [], trusted, rows, columns)
+                    images = _window_images(source, pending_cells, originals, [], client.cloud_max_images)
+                    schema = _table_schema(pending_cells, trusted, rows, columns)
         _validate_final_structure(recognized, rows, columns)
         html = _render_recognized_table(
             source, described, originals, recognized, resources, grid
@@ -761,10 +787,11 @@ def recognize_table(source, logical_table, client):
         )
     except RecognitionFailure as error:
         reasons.append(error.reason)
-        if not resources:
-            for part in logical_table.parts:
-                name = resource_name("unresolved-table", part.page, part.bbox)
-                resources[name] = source.crop(part.page, part.bbox)
+        # Complete physical coverage is required even after some windows passed
+        # or formula resources were retained before a later rendering failure.
+        for part in logical_table.parts:
+            name = resource_name("unresolved-table", part.page, part.bbox)
+            resources[name] = source.resource(part.page, part.bbox)
         html = "".join(
             f'<p><img src="{name}" alt="Unresolved table source"></p>'
             for name in resources

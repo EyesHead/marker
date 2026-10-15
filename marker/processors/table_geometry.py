@@ -186,7 +186,7 @@ def extract_grids(pdf_page):
                 'page': page, 'last_page': page, 'trusted': True, 'method': 'lines'}
         if not grid_positions(grid):
             continue
-        atoms = [{'kind': 'text', 'bbox': _bbox(w), 'text': w['text'], 'size': float(w['size']),
+        atoms = [{'kind': 'text', 'bbox': _bbox(w), 'text': w['text'], 'size': float(w['size']), 'fontname': w['fontname'],
                   'bold': 'bold' in w['fontname'].lower(), 'italic': any(s in w['fontname'].lower() for s in ('italic', 'oblique'))}
                  for w in words if _intersection(_bbox(w), bounds) > 0]
         atoms.extend({'kind': 'image', 'bbox': _bbox(image), 'image_index': i}

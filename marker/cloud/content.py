@@ -11,6 +11,7 @@ from xml.etree import ElementTree as ET
 from PIL import Image
 from pydantic import BaseModel, ConfigDict, model_validator
 
+from marker.cloud.client import semantic_error
 from marker.cloud.context import RecognitionFailure
 from marker.cloud.regions import Region, assess_text_quality
 
@@ -204,18 +205,37 @@ def group_expression_regions(regions):
             by_page.setdefault(region.page, []).append(atom)
     for page, atoms in by_page.items():
         for line in source_lines(atoms):
+            expressions = expression_groups(line)
+            owners = {atom_id(a, page): group for group in expressions for a in group}
             groups = []
             for atom in line:
-                if groups and atom["bbox"][0] - groups[-1][-1]["bbox"][2] <= 16:
+                expression = owners.get(atom_id(atom, page))
+                if expression is not None:
+                    if not any(group is expression for group in groups):
+                        groups.append(expression)
+                elif (
+                    groups
+                    and groups[-1] not in expressions
+                    and (atom["bbox"][0] - groups[-1][-1]["bbox"][2] <= 16)
+                ):
                     groups[-1].append(atom)
                 else:
                     groups.append([atom])
+            inline = (
+                (page, bounds(line))
+                if expressions
+                and any(
+                    atom_id(a, page) not in owners and a.get("kind", "text") == "text"
+                    for a in line
+                )
+                else None
+            )
             for group in groups:
                 box = bounds(group)
                 words = [a for a in group if a.get("kind", "text") == "text"]
                 kind = (
                     "math"
-                    if math_required(group)
+                    if group in expressions
                     else (
                         "image"
                         if any(a.get("kind") == "image" for a in group)
@@ -224,10 +244,22 @@ def group_expression_regions(regions):
                 )
                 kept.append(
                     Region(
-                        page, box, kind, tuple(group), assess_text_quality(words, box)
+                        page,
+                        box,
+                        kind,
+                        tuple(group),
+                        assess_text_quality(words, box),
+                        inline_group=inline,
                     )
                 )
-    return sorted(kept, key=lambda r: (r.page, r.bbox[1], r.bbox[0]))
+    return sorted(
+        kept,
+        key=lambda r: (
+            r.page,
+            r.inline_group[1][1] if r.inline_group else r.bbox[1],
+            r.bbox[0],
+        ),
+    )
 
 
 def latex_to_mathml(latex, *, display="inline"):
@@ -291,12 +323,12 @@ class RegionResponse(BaseModel):
             or (self.kind == "math" and not self.latex.strip())
             or (self.kind == "text" and not self.text.strip())
         ):
-            raise ValueError("Required content unresolved")
+            raise semantic_error("content_unresolved")
         if self.kind == "math":
             try:
                 latex_to_mathml(self.latex)
             except RecognitionFailure:
-                raise ValueError("Required math is unresolved or unsupported") from None
+                raise semantic_error("math_unsupported") from None
         return self
 
 
@@ -357,9 +389,9 @@ def recognize_region(source, region, client, *, allow_text=True):
             @model_validator(mode="after")
             def required_kind(self):
                 if not allow_text and self.kind == "text":
-                    raise ValueError("Required text OCR is disabled")
+                    raise semantic_error("content_ocr_disabled")
                 if region.kind == "math" and self.kind != "math":
-                    raise ValueError("Required expression must be math")
+                    raise semantic_error("content_expression_kind")
                 return self
 
         response = client.request(
@@ -368,11 +400,21 @@ def recognize_region(source, region, client, *, allow_text=True):
             RequiredRegionResponse,
         )
         if response["kind"] == "math":
-            html = latex_to_mathml(response["latex"], display=response["display"])
-            delimiter = "$$" if response["display"] == "block" else "$"
+            display = "inline" if region.inline_group else response["display"]
+            html = latex_to_mathml(response["latex"], display=display)
+            delimiter = "$$" if display == "block" else "$"
+            markdown = delimiter + response["latex"] + delimiter
+            # PDF extraction can attach a sentence separator to an operand.
+            # Preserve source punctuation when recognition omits it.
+            if region.inline_group and region.atoms:
+                punctuation = re.search(r"[,;:]$", region.atoms[-1].get("text", ""))
+                if punctuation and not response["latex"].rstrip().endswith(
+                    punctuation[0]
+                ):
+                    markdown += punctuation[0]
             return ContentResult(
                 "math",
-                delimiter + response["latex"] + delimiter,
+                markdown,
                 html,
                 resources,
                 latex=response["latex"],

@@ -23,7 +23,7 @@ from marker.renderers.markdown import MarkdownOutput, Markdownify
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
-def math_font_pdf(path):
+def math_font_pdf(path, *, ruled=False):
     """Small real PDF with explicit math font metadata and no optional test deps."""
     widths = " ".join(["600"] * 256)
     fonts = []
@@ -41,6 +41,8 @@ def math_font_pdf(path):
             ).encode()
         )
     stream = b"BT /F4 10 Tf 20 50 Td (For) Tj ET\nBT /F1 10 Tf 45 50 Td (xy) Tj ET\nBT /F2 10 Tf 60 50 Td (a) Tj ET\nBT /F3 10 Tf 70 50 Td (0) Tj ET\nBT /F4 10 Tf 90 50 Td (where) Tj ET"
+    if ruled:
+        stream += b"\n10 30 m 170 30 l S 10 70 m 170 70 l S 10 30 m 10 70 l S 140 30 m 140 70 l S 170 30 m 170 70 l S"
     objects = [
         b"<< /Type /Catalog /Pages 2 0 R >>",
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",

@@ -34,6 +34,7 @@ class Region:
     image: NativeImage | None = None
     grid: dict | None = field(default=None, compare=False)
     required: bool = True
+    inline_group: tuple | None = None
 
 
 def _coverage(images, box):

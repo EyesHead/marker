@@ -8,7 +8,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from marker.cloud.client import CloudClient
+from marker.cloud.client import CloudClient, semantic_error
 from marker.cloud.content import (
     ContentResult,
     group_expression_regions,
@@ -64,42 +64,42 @@ def _layout_schema(box):
         @model_validator(mode="after")
         def source_geometry(self):
             if not self.complete or not self.regions:
-                raise ValueError("Required visible layout remains unresolved")
+                raise semantic_error("layout_unresolved")
             previous = []
             for region in self.regions:
                 if not _contains(box, region.bbox):
-                    raise ValueError("Layout region exceeds assigned source bounds")
+                    raise semantic_error("layout_source_bounds")
                 if any(intersection(region.bbox, other) > 0 for other in previous):
-                    raise ValueError("Layout regions overlap source ownership")
+                    raise semantic_error("layout_ownership_overlap")
                 previous.append(region.bbox)
                 if region.kind != "table":
                     if region.cells:
-                        raise ValueError("Only tables can own cells")
+                        raise semantic_error("layout_only_tables_own_cells")
                     continue
                 if not region.cells:
-                    raise ValueError("Table requires source cells")
+                    raise semantic_error("layout_table_cells_missing")
                 for cell in region.cells:
                     if not _contains(region.bbox, cell.bbox):
-                        raise ValueError("Cell exceeds table bounds")
+                        raise semantic_error("layout_cell_bounds")
                     for line in cell.lines:
                         if not _contains(cell.bbox, line.bbox):
-                            raise ValueError("Baseline exceeds cell bounds")
+                            raise semantic_error("layout_line_bounds")
                     if any(
                         intersection(a.bbox, b.bbox) > 0
                         for i, a in enumerate(cell.lines)
                         for b in cell.lines[i + 1 :]
                     ):
-                        raise ValueError("Baseline atoms overlap")
+                        raise semantic_error("layout_line_overlap")
                 grid = {"cells": [{"bbox": c.bbox} for c in region.cells]}
                 positions = grid_positions(grid)
                 if positions is None:
-                    raise ValueError("Table source cells must cover a rectangular grid")
+                    raise semantic_error("layout_rectangular_grid")
                 xs, ys, _ = positions
                 if any(
                     abs(a - b) > 0.1
                     for a, b in zip((xs[0], ys[0], xs[-1], ys[-1]), region.bbox)
                 ):
-                    raise ValueError("Table cells must cover the entire table extent")
+                    raise semantic_error("layout_full_table_coverage")
             return self
 
     return LayoutResponse
@@ -252,6 +252,16 @@ class OllamaPdfConverter(BaseConverter):
             "cloud_base_url",
         ):
             client_config[key] = getattr(self, key)
+        for cloud_key, service_key in (
+            ("cloud_model", "openai_model"),
+            ("cloud_base_url", "openai_base_url"),
+        ):
+            if (
+                cloud_key not in self.config
+                and f"{type(self).__name__}_{cloud_key}" not in self.config
+                and service_key in self.config
+            ):
+                client_config[cloud_key] = self.config[service_key]
         self.client = (artifact_dict or {}).get("cloud_client") or CloudClient(
             client_config
         )
@@ -397,9 +407,15 @@ class OllamaPdfConverter(BaseConverter):
                                 atom["kind"], atom["text"] = "unknown", ""
                 result = recognize_table(source, table, self.client)
                 outputs.append((part.page, part.bbox[1], part.bbox[0], result))
+            inline_results = {}
             for region in group_expression_regions(
                 [r for r in regions if r.kind != "table"]
             ):
+                if region.inline_group:
+                    inline_results.setdefault(region.inline_group, []).append(
+                        (region.bbox[0], self._recognize(source, region))
+                    )
+                    continue
                 outputs.append(
                     (
                         region.page,
@@ -408,6 +424,25 @@ class OllamaPdfConverter(BaseConverter):
                         self._recognize(source, region),
                     )
                 )
+            for (page, box), parts in inline_results.items():
+                results = [
+                    result for _, result in sorted(parts, key=lambda item: item[0])
+                ]
+                result = ContentResult(
+                    "text",
+                    " ".join(r.markdown for r in results if r.markdown),
+                    resources={
+                        name: image
+                        for r in results
+                        for name, image in r.resources.items()
+                    },
+                    complete=all(r.complete for r in results),
+                    reasons=tuple(reason for r in results for reason in r.reasons),
+                    source_atom_ids=tuple(
+                        identity for r in results for identity in r.source_atom_ids
+                    ),
+                )
+                outputs.append((page, box[1], box[0], result))
         markdown = []
         for page, _, _, result in sorted(outputs, key=lambda item: item[:3]):
             if result.markdown:

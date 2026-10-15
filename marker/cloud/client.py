@@ -12,8 +12,43 @@ import openai
 from PIL import Image
 from pydantic import BaseModel, ValidationError
 from pydantic_core.core_schema import ErrorType
+from pydantic_core import PydanticCustomError
 
 from marker.cloud.context import RecognitionFailure, fit_request
+
+
+# Curated constraints only: arbitrary validator/provider text is never reflected.
+SEMANTIC_ERRORS = {
+    "layout_unresolved": "Required visible layout remains unresolved",
+    "layout_source_bounds": "Layout region exceeds assigned source bounds",
+    "layout_ownership_overlap": "Layout regions overlap source ownership",
+    "layout_only_tables_own_cells": "Only tables can own cells",
+    "layout_table_cells_missing": "Table requires source cells",
+    "layout_cell_bounds": "Cell exceeds table bounds",
+    "layout_line_bounds": "Baseline exceeds cell bounds",
+    "layout_line_overlap": "Baseline atoms overlap",
+    "layout_rectangular_grid": "Table source cells must cover a rectangular grid",
+    "layout_full_table_coverage": "Table cells must cover the entire table extent",
+    "math_unsupported": "Required math is unresolved or unsupported",
+    "table_cell_ownership": "Cell IDs must cover assigned cells once",
+    "table_trusted_spans": "Trusted physical spans cannot change",
+    "table_span_bounds": "Cell span exceeds table extent",
+    "table_span_overlap": "Cell spans overlap",
+    "table_line_ownership": "Source baseline lines must be covered once",
+    "table_atom_ownership": "Line source atoms must be owned exactly once",
+    "table_complete_expression": "Complete source expression must have one math owner",
+    "table_content_ownership": "Output content has no source ownership",
+    "table_selectable_text_figure": "Selectable text cannot disappear into a figure",
+    "table_text_unresolved": "Required text remains unresolved",
+    "content_unresolved": "Required content unresolved",
+    "content_ocr_disabled": "Required text OCR is disabled",
+    "content_expression_kind": "Required expression must be math",
+}
+
+
+def semantic_error(code: str):
+    """Create one declared constraint; only its registry text may be emitted."""
+    return PydanticCustomError(code, SEMANTIC_ERRORS[code])
 
 
 class ResponseValidationError(ValueError):
@@ -43,6 +78,8 @@ def schema_error_reason(error: ValidationError, schema: type[BaseModel]) -> str:
         ) or "JSON"
         error_type = item["type"] if item["type"] in known_types else "validation_error"
         detail = f"{location}: {error_type}"
+        if item["type"] in SEMANTIC_ERRORS:
+            detail = f"{location}: {SEMANTIC_ERRORS[item['type']]}"
         if error_type == "json_invalid":
             position = re.search(r"line (\d+) column (\d+)", item["msg"])
             if position:
@@ -109,6 +146,26 @@ def repair_prompt(prompt: str, reason: str) -> str:
     )
 
 
+def context_overflow(error):
+    """Classify locally; no provider body/message is returned to callers."""
+    if not isinstance(error, openai.APIStatusError) or error.status_code != 400:
+        return False
+    body = error.body if isinstance(error.body, dict) else {}
+    body = body.get("error", body)
+    if not isinstance(body, dict):
+        return False
+    return body.get("code") in (
+        "context_length_exceeded",
+        "context_window_exceeded",
+    ) or bool(
+        re.search(
+            r"(?:input length exceeds|exceed[^.]*context (?:window|length)|context length exceeded)",
+            str(body.get("message", "")),
+            re.I,
+        )
+    )
+
+
 def retryable_provider_error(error: Exception) -> bool:
     return isinstance(error, (openai.APIConnectionError, openai.APITimeoutError, openai.RateLimitError)) or (
         isinstance(error, openai.APIStatusError) and error.status_code >= 500
@@ -162,7 +219,14 @@ class CloudClient:
                 raise RecognitionFailure("Document cloud request budget exhausted", attempts=attempts)
             self.request_count += 1
 
-    def request(self, prompt: str, images, schema: type[BaseModel]) -> dict:
+    def request(
+        self, prompt: str, images, schema: type[BaseModel], *, context_reflow=None
+    ) -> dict:
+        """Recognize once with at most cloud_max_attempts, including owner reflow.
+
+        context_reflow() may return a strictly smaller (prompt, images, schema)
+        tuple after a server context error, or None for an indivisible region.
+        """
         images = [images] if isinstance(images, Image.Image) else list(images or [])
         if len(images) > self.cloud_max_images:
             raise RecognitionFailure("Required images exceed the cloud request image limit")
@@ -206,6 +270,46 @@ class CloudClient:
                 reason = str(error)
                 current_prompt = repair_prompt(original_prompt, reason)
             except Exception as error:
+                if context_overflow(error):
+                    reason = "Provider context limit exceeded; reduce the assigned source window"
+                    if attempts >= self.cloud_max_attempts:
+                        raise RecognitionFailure(reason, attempts=attempts) from None
+                    # The owner can reduce text/line ownership as well as pixels.
+                    # Reflow remains inside this request's original attempt loop.
+                    replacement = (
+                        context_reflow() if context_reflow is not None else None
+                    )
+                    if replacement is not None:
+                        prompt, replacement_images, replacement_schema = replacement
+                        replacement_prompt = schema_prompt(prompt, replacement_schema)
+                        replacement_images = list(replacement_images)
+                        if len(replacement_images) > self.cloud_max_images:
+                            raise RecognitionFailure(
+                                "Required images exceed the cloud request image limit",
+                                attempts=attempts,
+                            )
+                        if len(replacement_prompt.encode()) >= len(
+                            current_prompt.encode()
+                        ):
+                            raise RecognitionFailure(
+                                reason, attempts=attempts
+                            ) from None
+                        schema = replacement_schema
+                        images = replacement_images
+                        original_prompt = current_prompt = replacement_prompt
+                        continue
+                    # Atomic regions can still reduce disposable image copies.
+                    # Never retry an identical oversized payload.
+                    reduced = []
+                    for image in copies:
+                        target = max(1, max(image.size) // 2)
+                        copy = image.copy()
+                        copy.thumbnail((target, target), Image.Resampling.LANCZOS)
+                        reduced.append(copy)
+                    if not any(a.size != b.size for a, b in zip(copies, reduced)):
+                        raise RecognitionFailure(reason, attempts=attempts) from None
+                    images = reduced
+                    continue
                 reason = provider_error_reason(error)
                 if not retryable_provider_error(error):
                     raise RecognitionFailure(reason, attempts=attempts) from None
