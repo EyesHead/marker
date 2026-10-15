@@ -385,6 +385,23 @@ def recognize_region(source, region, client, *, allow_text=True):
             "formula" if region.kind == "math" else "source", region.page, region.bbox
         )
         resources[name] = retained
+        if region.kind == "text" and region.quality.trusted:
+            # Mixed trusted content must be partitioned before mathematical OCR;
+            # retain every source word when that partition remains ambiguous.
+            text = "\n".join(
+                " ".join(a.get("text", "") for a in line)
+                for line in source_lines(region.atoms)
+            )
+            return ContentResult(
+                "text",
+                text + f"\n\n![Unresolved source]({name})",
+                resources=resources,
+                complete=False,
+                reasons=(
+                    "Required source has unpartitioned mathematical content and prose",
+                ),
+                source_atom_ids=identities,
+            )
         payload = {
             "page": region.page,
             "bbox": region.bbox,

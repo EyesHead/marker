@@ -248,6 +248,55 @@ class FinalIntegrationTests(unittest.TestCase):
                     )
                     self.assertEqual(client.request_count, len(owners))
 
+    def test_interrupted_parenthetical_math_seed_keeps_full_source_with_honest_fallback(
+        self,
+    ):
+        from copy import deepcopy
+        from marker.cloud.content import group_expression_regions
+        from marker.cloud.regions import analyze_page
+
+        for sentence in (
+            "For (x = 0, for example) accepted",
+            "For ( x = 0; for example ) accepted",
+        ):
+            with (
+                self.subTest(sentence=sentence),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                filename = Path(directory) / "interrupted-math-seed.pdf"
+                simple_pdf(filename, sentence)
+                client, observed = offline_client(
+                    lambda s, n: {"kind": "math", "resolved": True, "latex": "x = 0"}
+                )
+                output = OllamaPdfConverter(artifact_dict={"cloud_client": client})(
+                    filename
+                )
+                self.assertEqual(
+                    output.metadata["cloud_conversion"]["status"], "incomplete"
+                )
+                self.assertEqual(output.markdown.split("\n\n", 1)[0], sentence)
+                self.assertIn("\n\n![Unresolved source](", output.markdown)
+                self.assertIn(
+                    "unpartitioned",
+                    " ".join(output.metadata["cloud_conversion"]["reasons"]),
+                )
+                self.assertEqual(client.request_count, 0)
+                self.assertEqual(observed, [])
+                with PdfSource(filename) as source:
+                    regions = analyze_page(source, 0)
+                    original = deepcopy([r.atoms for r in regions])
+                    grouped = group_expression_regions(regions)
+                    self.assertEqual([r.atoms for r in regions], original)
+                    self.assertEqual(len(grouped), 1)
+                    self.assertEqual(grouped[0].kind, "text")
+                    self.assertEqual(
+                        [a["text"] for a in grouped[0].atoms], sentence.split()
+                    )
+                    expected = source.resource(grouped[0].page, grouped[0].bbox)
+                    audit = next(iter(output.images.values()))
+                    self.assertEqual(audit.size, expected.size)
+                    self.assertEqual(audit.tobytes(), expected.tobytes())
+
     def test_bracketed_expression_owns_internal_separators_and_nested_operands(self):
         from copy import deepcopy
         from marker.cloud.content import group_expression_regions
