@@ -18,6 +18,13 @@ from marker.cloud.regions import Region, assess_text_quality
 MATH_NAMESPACE = "http://www.w3.org/1998/Math/MathML"
 ET.register_namespace("", MATH_NAMESPACE)
 
+MATH_CLASSIFICATION_PROMPT = (
+    "A single mathematical glyph, variable, or subscripted letter is a complete expression, "
+    "even without an equals sign or operator. Classify it as math, including when stored as raster pixels. "
+    "When transcribing math, always return exact LaTeX. Reserve figure for actual diagrams, photos, and plots; "
+    "raster storage alone never makes mathematical content a figure. "
+)
+
 
 @dataclass
 class ContentResult:
@@ -438,7 +445,8 @@ def recognize_region(source, region, client, *, allow_text=True):
             "Recognize only the assigned source atoms in this crop. Nearby pixels are context, never additional output. "
             "Classify a complete mathematical expression as math; transcribe ALL operators, subscripts and superscripts "
             "in one LaTeX string. Preserve phi/varphi, Cyrillic/Latin subscripts and decimal commas exactly. "
-            "A diagram is figure. Never guess unreadable content: set resolved=false.\nSOURCE:\n"
+            + MATH_CLASSIFICATION_PROMPT
+            + "Never guess unreadable content: set resolved=false.\nSOURCE:\n"
             + json.dumps(payload, ensure_ascii=False)
         )
 

@@ -12,8 +12,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from marker.cloud.client import schema_prompt, semantic_error
 from marker.cloud.content import (
-    ContentResult, atom_id, bounds, context_box, expression_groups, latex_to_mathml,
-    resource_name, source_lines,
+    MATH_CLASSIFICATION_PROMPT, ContentResult, atom_id, bounds, context_box,
+    expression_groups, latex_to_mathml, resource_name, source_lines,
 )
 from marker.cloud.context import RecognitionFailure, fit_request
 from marker.cloud.regions import assess_text_quality, word_lines
@@ -444,7 +444,8 @@ def _window_prompt(cells, headers, trusted, rows, columns):
         "a merged cell may contain multiple expressions. Retain trusted spans exactly. If trusted=false, "
         "reconstruct row/column spans within the table dimensions without overlap, retaining source cell/line IDs. "
         "Use math with exact LaTeX for complete expressions, figure for diagrams, text for ordinary words. "
-        "Each expression_groups entry must be owned in full by one math part; keep surrounding prose "
+        + MATH_CLASSIFICATION_PROMPT
+        + "Each expression_groups entry must be owned in full by one math part; keep surrounding prose "
         "and independent expressions in separate parts. Never transcribe a required operator alone. "
         "Preserve phi/varphi, Cyrillic/Latin subscripts, decimal commas and superscripts. "
         "Do not guess unreadable content.\nSOURCE:\n"

@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from marker.cloud.client import CloudClient, semantic_error
 from marker.cloud.content import (
+    MATH_CLASSIFICATION_PROMPT,
     ContentResult,
     group_expression_regions,
     recognize_region,
@@ -114,7 +115,9 @@ def scan_layout(source, region, client):
         "For each table provide physical cell rectangles tiling the entire table, including merged "
         "cells and blank cells; provide a separate tight line rectangle for EVERY visible baseline "
         "inside each cell. Do not combine multiple baselines into one bitmap. Non-table cells=[]. "
-        "Classify formulas as math even when OCR is disabled. Decoration must be explicitly classified. "
+        "Classify formulas as math even when OCR is disabled. "
+        + MATH_CLASSIFICATION_PROMPT
+        + "Decoration must be explicitly classified. "
         "Set complete=false for any unreadable, missing or uncertain layout.\nSOURCE:\n"
         + json.dumps({"stage": "layout", "page": region.page, "bbox": region.bbox})
     )

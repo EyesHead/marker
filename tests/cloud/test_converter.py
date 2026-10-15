@@ -313,6 +313,35 @@ class AdaptiveConverterTests(unittest.TestCase):
         self.assertEqual(len(vectors), 2)
         self.assertTrue(all(a["bbox"][1] == a["bbox"][3] for a in vectors))
 
+    def test_symbol_versus_figure_rule_reaches_every_recognition_stage(self):
+        from marker.converters.ollama import OllamaPdfConverter
+
+        prompts = []
+        for fixture in ("native_figure.pdf", "split_formula.pdf"):
+            client, _ = offline_client(respond, prompts=prompts)
+            OllamaPdfConverter(artifact_dict={"cloud_client": client})(
+                str(FIXTURES / fixture)
+            )
+        stages = set()
+        for prompt in prompts:
+            instructions, source = prompt.split("SOURCE:\n", 1)
+            payload = json.JSONDecoder().raw_decode(source)[0]
+            stage = (
+                "table" if "cells" in payload else payload.get("stage", "region")
+            )
+            stages.add(stage)
+            with self.subTest(stage=stage):
+                # Inspect outgoing request instructions, without importing the
+                # production prompt constant as the expected value.
+                self.assertIn("single mathematical glyph", instructions)
+                self.assertIn("subscripted letter", instructions)
+                self.assertIn("without an equals sign or operator", instructions)
+                self.assertIn("math", instructions)
+                self.assertIn("LaTeX", instructions)
+                self.assertIn("diagrams, photos, and plots", instructions)
+                self.assertIn("raster storage alone", instructions)
+        self.assertEqual(stages, {"layout", "region", "table"})
+
     def test_decoration_classification_keeps_required_native_image_incomplete(self):
         from marker.cloud.source import PdfSource
 

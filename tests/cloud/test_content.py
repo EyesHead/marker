@@ -69,7 +69,7 @@ def math_font_pdf(path, *, ruled=False, separator="", suffix="where"):
     Path(path).write_bytes(data)
 
 
-def offline_client(responder, config=None):
+def offline_client(responder, config=None, *, prompts=None):
     observed = []
 
     def respond(request):
@@ -84,6 +84,8 @@ def offline_client(responder, config=None):
                 assert max(image.size) <= 1536
                 assert image.convert("L").getextrema()[0] < 240
         prompt = next(item["text"] for item in content if item["type"] == "text")
+        if prompts is not None:
+            prompts.append(prompt)
         source = json.JSONDecoder().raw_decode(prompt.split("SOURCE:\n", 1)[1])[0]
         observed.append(source)
         result = responder(source, len(observed))
@@ -245,6 +247,45 @@ class ContentTests(unittest.TestCase):
                 BeautifulSoup(converted, "html.parser").find("semantics")
             )
             self.assertNotIn("$x", converted)
+
+    def test_unhinted_single_raster_glyph_can_be_math_while_diagram_stays_figure(self):
+        from marker.cloud.tables import recognize_table
+
+        with PdfSource(FIXTURES / "split_formula.pdf") as source:
+            table = group_tables(detect_tables(source), None)[0]
+            # Isolate the actual raster ≥ as its own assigned content. The
+            # original diagram stays in a separate cell without math hints.
+            symbol_cell = next(
+                cell for cell in table.grid["cells"]
+                if cell["bbox"] == (30.0, 140.0, 130.0, 180.0)
+            )
+            symbol_cell["atoms"] = [
+                atom for atom in symbol_cell["atoms"] if atom["kind"] == "image"
+            ]
+
+            def response(payload, attempt):
+                result = table_echo(payload, attempt)
+                for original, cell in zip(payload["cells"], result["cells"]):
+                    for source_line, line in zip(original["lines"], cell["lines"]):
+                        if any(
+                            atom["bbox"] == [54.0, 146.0, 70.0, 162.0]
+                            for atom in source_line["atoms"]
+                        ):
+                            self.assertFalse(source_line["math_required"])
+                            line["parts"] = [{
+                                "kind": "math", "latex": r"\geq",
+                                "atom_ids": [source_line["atoms"][0]["id"]],
+                            }]
+                return result
+
+            client, _ = offline_client(response)
+            result = recognize_table(source, table, client)
+            self.assertTrue(result.complete, result.reasons)
+            soup = BeautifulSoup(result.html, "html.parser")
+            self.assertEqual(soup.find("annotation").text, r"\geq")
+            figures = soup.find_all("img")
+            self.assertEqual(len(figures), 1)
+            self.assertEqual(result.resources[figures[0]["src"]].size, (240, 160))
 
     def test_phi_variants_have_exact_annotations_and_distinct_glyphs(self):
         content = self.content()
