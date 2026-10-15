@@ -7,6 +7,7 @@ import getpass
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -16,7 +17,7 @@ import warnings
 
 REPOSITORY = "https://github.com/EyesHead/marker.git"
 REF = "codex/my-change"
-CONVERTER = "marker.converters.ollama.OllamaPdfConverter"
+CONVERTER = "marker.converters.ollama_document.StagedOllamaPdfConverter"
 
 
 class LauncherError(Exception):
@@ -180,6 +181,7 @@ class Processes:
 
 def adaptive_source(source):
     return ((source / "marker/converters/ollama.py").is_file()
+            and (source / "marker/converters/ollama_document.py").is_file()
             and not (source / "marker/processors/llm/llm_table_json.py").exists())
 
 
@@ -256,6 +258,7 @@ def conversion_arguments(args, python, pdf, output):
                "--page_batch_size", args.page_batch_size, "--redo_inline_math"]
     for field in ("context_tokens", "max_output_tokens", "max_images", "crop_dpi", "max_attempts", "max_requests", "max_concurrency"):
         command.extend(["--cloud_" + field, getattr(args, field)])
+    command.extend(["--cloud_work_dir", args.directory / "Output" / ".marker-work"])
     if args.disable_ocr:
         command.append("--disable_ocr")
     if args.force_ocr:
@@ -263,15 +266,33 @@ def conversion_arguments(args, python, pdf, output):
     return list(map(str, command))
 
 
-def publish_output(generated, note, name, secret):
+def publish_output(generated, note, name, secret, *, replace_generated=False):
     # Reject an accidental credential echo before it can reach published files.
     if secret and any(secret.encode("utf-8") in path.read_bytes()
                       for path in generated.rglob("*") if path.is_file()):
         raise LauncherError("Converter output contains a credential; result was not published.")
     with tempfile.TemporaryDirectory(prefix=".marker-publish-", dir=note.parent) as temporary:
         stage, backup = Path(temporary) / "result", None
+        obsolete=set()
         if note.exists():
             shutil.copytree(note, stage)
+            if replace_generated:
+                try:
+                    previous=completion_metadata(note,name)
+                except LauncherError:
+                    previous={}
+                if previous:
+                    inventory=previous.get('generated_assets',[])
+                    known=set(inventory) if isinstance(inventory,list) and all(isinstance(item,str) for item in inventory) else set()
+                    # Migration from previous cloud versions, which did not
+                    # inventory their generated evidence PNGs. User filenames
+                    # outside this precise generated naming convention stay.
+                    pattern=re.compile(r'^(?:formula|figure|source|unresolved(?:-table)?)-p\d+-[0-9a-f]{16}\.png$')
+                    known.update(path.name for path in note.iterdir() if path.is_file() and pattern.fullmatch(path.name))
+                    obsolete={asset for asset in known if isinstance(asset,str) and
+                              Path(asset).name==asset and not (generated/asset).exists()}
+                    for asset in obsolete:
+                        (stage/asset).unlink(missing_ok=True)
         else:
             stage.mkdir()
         shutil.copytree(generated, stage, dirs_exist_ok=True)
@@ -290,8 +311,9 @@ def publish_output(generated, note, name, secret):
                 except OSError:
                     raise LauncherError(f"Publication failed; previous result retained at {backup}.") from None
             raise
-        if backup is not None:
+        if backup is not None and not obsolete:
             shutil.rmtree(backup)
+        return backup if obsolete else None
 
 
 def parse_arguments(argv):
@@ -303,8 +325,8 @@ def parse_arguments(argv):
     parser.add_argument("--ref", default=os.environ.get("MARKER_REF", REF))
     parser.add_argument("--model", default=os.environ.get("OLLAMA_MODEL", "gemma4:31b"))
     parser.add_argument("--base-url", default=os.environ.get("OLLAMA_BASE_URL", "https://ollama.com/v1"))
-    for name, default in (("context_tokens", 8192), ("max_output_tokens", 2048),
-                          ("max_images", 3), ("crop_dpi", 600), ("max_attempts", 3), ("max_requests", 0), ("max_concurrency", 2)):
+    for name, default in (("context_tokens", 245760), ("max_output_tokens", 16384),
+                          ("max_images", 8), ("crop_dpi", 600), ("max_attempts", 3), ("max_requests", 0), ("max_concurrency", 2)):
         parser.add_argument("--" + name.replace("_", "-"), type=int,
                             default=os.environ.get("CLOUD_" + name.upper(), default))
     parser.add_argument("--page-batch-size", type=int, default=os.environ.get("PAGE_BATCH_SIZE", 30))
@@ -373,7 +395,16 @@ def main(argv=None) -> int:
                     if result.returncode and status["status"] != "incomplete":
                         raise LauncherError(f"Conversion failed for {pdf.name} (exit {result.returncode}).")
                     note = output / pdf.stem
-                    publish_output(generated, note, pdf.stem, secret)
+                    if status["status"] == "incomplete" and status.get("publishable") is False:
+                        failures += 1
+                        processes.message(f"Incomplete: {pdf.name}; intermediate draft retained at {status.get('work_dir', '')}", error=True)
+                        for reason in status["reasons"]:
+                            processes.message("  " + reason, error=True)
+                        continue
+                    backup=publish_output(generated, note, pdf.stem, secret,
+                                          replace_generated=status.get('pipeline')=='whole-object-v1')
+                    if backup:
+                        processes.message(f"Previous generated resources retained in hidden backup: {backup}")
                     if status["status"] == "incomplete":
                         failures += 1
                         processes.message(f"Incomplete: {pdf.name}; partial output saved to {note}", error=True)

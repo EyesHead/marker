@@ -31,6 +31,9 @@ def fit_request(
     images: Sequence[Image.Image],
     budget: int,
     max_output_tokens: int,
+    *,
+    max_image_edge: int = 1536,
+    min_image_edge: int = 128,
 ) -> list[Image.Image]:
     """Return reduced request copies, retaining every source image untouched.
 
@@ -40,6 +43,8 @@ def fit_request(
     """
     if budget <= 0 or max_output_tokens <= 0 or max_output_tokens >= budget:
         raise RecognitionFailure("Request context budget cannot reserve the response")
+    if not 1 <= min_image_edge <= max_image_edge:
+        raise RecognitionFailure("Request image bounds are invalid")
     if estimate_request_tokens(prompt, []) + max_output_tokens > budget:
         raise RecognitionFailure("Prompt exceeds the request context budget")
 
@@ -48,7 +53,7 @@ def fit_request(
         if not isinstance(image, Image.Image) or min(image.size) <= 0:
             raise RecognitionFailure("Request images must have valid pixel dimensions")
         copy = image.copy()
-        copy.thumbnail((1536, 1536), Image.Resampling.LANCZOS)
+        copy.thumbnail((max_image_edge, max_image_edge), Image.Resampling.LANCZOS)
         copies.append(copy)
 
     for step in range(13):
@@ -60,7 +65,7 @@ def fit_request(
         changed = False
         for image in copies:
             edge = max(image.size)
-            target = max(128, int(edge * 0.75))
+            target = max(min_image_edge, int(edge * 0.75))
             if target >= edge:
                 reduced.append(image)
                 continue

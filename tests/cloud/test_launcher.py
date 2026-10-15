@@ -52,6 +52,7 @@ class OfflineProcesses:
         self.fail_install = False
         self.emit_secret = False
         self.write_secret = False
+        self.publishable = None
 
     def __call__(self, args, **kwargs):
         args = list(map(str, args))
@@ -78,8 +79,12 @@ class OfflineProcesses:
             if self.write_secret:
                 (output / "cell.png").write_bytes(b"accidental credential echo: " + KEY.encode())
             if self.metadata:
+                state={"status":self.status,"reasons":self.reasons,"requests":2}
+                if self.publishable is not None:
+                    state['publishable']=self.publishable
+                    state['work_dir']=str(output/'.marker-work')
                 (output / (pdf.stem + "_meta.json")).write_text(json.dumps({"cloud_conversion": {
-                    "status": self.status, "reasons": self.reasons, "requests": 2
+                    **state
                 }}), encoding="utf-8")
             stdout = "converter " + KEY if self.emit_secret else "converter finished"
             stderr = "diagnostic " + KEY if self.emit_secret else ""
@@ -134,6 +139,7 @@ class LauncherTests(unittest.TestCase):
         converter = self.remote / "marker/converters/ollama.py"
         converter.parent.mkdir(parents=True)
         converter.write_text("# adaptive converter capability", encoding="utf-8")
+        (converter.parent/'ollama_document.py').write_text('# staged whole-object converter',encoding='utf-8')
         (self.remote / "pyproject.toml").write_text("# installation fixture", encoding="utf-8")
         git("-C", self.remote, "add", ".")
         git("-C", self.remote, "commit", "-m", "Adaptive source")
@@ -275,11 +281,11 @@ class LauncherTests(unittest.TestCase):
         status, stdout, stderr = self.run_launcher(env={"DISABLE_OCR": "1"})
         self.assertEqual(status, 0, stdout + stderr)
         args = self.process.conversions()[0][0]
-        for flag, value in {"--converter_cls": "marker.converters.ollama.OllamaPdfConverter",
+        for flag, value in {"--converter_cls": "marker.converters.ollama_document.StagedOllamaPdfConverter",
                             "--output_format": "markdown", "--llm_service": "marker.services.openai.OpenAIService",
                             "--openai_base_url": "https://ollama.com/v1", "--openai_model": "gemma4:31b",
-                            "--cloud_context_tokens": "8192", "--cloud_max_output_tokens": "2048",
-                            "--cloud_max_images": "3", "--cloud_crop_dpi": "600",
+                            "--cloud_context_tokens": "245760", "--cloud_max_output_tokens": "16384",
+                            "--cloud_max_images": "8", "--cloud_crop_dpi": "600",
                             "--cloud_max_attempts": "3", "--cloud_max_requests": "0",
                             "--page_batch_size": "30"}.items():
             self.assertEqual(args[args.index(flag) + 1], value)
@@ -350,6 +356,17 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(self.run_launcher()[0], 0)
         self.assertEqual(len(self.process.conversions()), 1)
 
+    def test_unpublishable_staged_result_preserves_existing_note(self):
+        self.note.mkdir(parents=True)
+        existing=self.note/(self.pdf.stem+'.md')
+        existing.write_text('Previous readable result',encoding='utf-8')
+        self.process.status='incomplete'
+        self.process.publishable=False
+        status,stdout,stderr=self.run_launcher(['--force'])
+        self.assertEqual(status,1)
+        self.assertEqual(existing.read_text(),'Previous readable result')
+        self.assertIn('draft',stderr.lower())
+
     def test_generated_resource_credential_echo_is_rejected_before_publication(self):
         self.assertEqual(self.run_launcher()[0], 0)
         target = self.note / (self.pdf.stem + ".md")
@@ -407,6 +424,67 @@ class LauncherTests(unittest.TestCase):
         previous = [path for path in (self.folder / "Output").rglob("*.md")
                     if path.read_text(encoding="utf-8") == "preserved previous result"]
         self.assertTrue(previous, "Publication/rollback failure deleted the previous result")
+
+    def test_full_publication_retires_generated_pngs_to_hidden_backup(self):
+        old_images = {
+            "formula-p0-0123456789abcdef.png": b"previous formula evidence",
+            "unresolved-table-p1-fedcba9876543210.png": b"previous unresolved table",
+            "source-p2-0011223344556677.png": b"previous source page",
+        }
+        user_images = {
+            "мой рисунок.png": b"user image",
+            "formula-not-generated.png": b"user image with a similar name",
+        }
+        figure = "figure-p3-abcdef0123456789.png"
+        markdown_name = self.pdf.stem + ".md"
+        metadata_name = self.pdf.stem + "_meta.json"
+        for inventoried in (False, True):
+            with self.subTest(inventoried=inventoried):
+                parent = self.root / ("inventoried" if inventoried else "legacy")
+                note = parent / self.pdf.stem
+                note.mkdir(parents=True)
+                previous_images = dict(old_images)
+                state = {"status": "incomplete", "reasons": ["old unresolved images"], "requests": 4}
+                if inventoried:
+                    previous_images["tracked-old-resource.png"] = b"inventoried generated image"
+                    state["generated_assets"] = list(previous_images)
+                old_markdown = "Previous result\n" + "\n".join(
+                    f"![previous]({name})" for name in previous_images
+                )
+                (note / markdown_name).write_text(old_markdown, encoding="utf-8")
+                (note / metadata_name).write_text(json.dumps({"cloud_conversion": state}), encoding="utf-8")
+                for name, data in {**previous_images, **user_images}.items():
+                    (note / name).write_bytes(data)
+
+                generated = parent / "generated"
+                generated.mkdir()
+                new_markdown = f"Complete formula: $x^2$\n\n![Figure]({figure})\n"
+                (generated / markdown_name).write_text(new_markdown, encoding="utf-8")
+                (generated / figure).write_bytes(b"new referenced figure")
+                (generated / metadata_name).write_text(json.dumps({"cloud_conversion": {
+                    "status": "complete", "reasons": [], "requests": 2,
+                    "pipeline": "whole-object-v1", "generated_assets": [figure],
+                }}), encoding="utf-8")
+
+                backup = self.launcher.publish_output(
+                    generated, note, self.pdf.stem, KEY, replace_generated=True
+                )
+
+                self.assertIsNotNone(backup)
+                self.assertEqual(backup.parent, note.parent)
+                self.assertTrue(backup.name.startswith(".marker-previous-"))
+                self.assertEqual((backup / markdown_name).read_text(encoding="utf-8"), old_markdown)
+                self.assertEqual((note / markdown_name).read_text(encoding="utf-8"), new_markdown)
+                for name, data in previous_images.items():
+                    self.assertFalse((note / name).exists(), name)
+                    self.assertEqual((backup / name).read_bytes(), data)
+                for name, data in user_images.items():
+                    self.assertEqual((note / name).read_bytes(), data)
+                    self.assertEqual((backup / name).read_bytes(), data)
+                self.assertEqual((note / figure).read_bytes(), b"new referenced figure")
+                self.assertEqual(
+                    self.launcher.completion_metadata(note, self.pdf.stem)["status"], "complete"
+                )
 
     def test_legacy_table_json_forces_reconversion_then_is_removed(self):
         self.assertEqual(self.run_launcher()[0], 0)

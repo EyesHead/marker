@@ -26,12 +26,14 @@ MATH_CLASSIFICATION_PROMPT = (
     "When transcribing math, always return exact LaTeX. Reserve figure for actual diagrams, photos, and plots; "
     "raster storage alone never makes mathematical content a figure. "
 )
-MATH_TRANSCRIPTION_PROMPT = (
+MATH_BASELINE_PROMPT = (
     "Read the main baseline and every subscript/superscript before writing LaTeX. "
     "Keep ALL lowered letters in one braced index on their actual base: "
     r"for a source R with lowered bun, write R_{bun} or R_{\text{bun}}, never Rb_{un}. "
     "Do not move any letter between a baseline and an index, split a multi-letter index, "
     "or invent an index from a familiar formula. Check against the pixels, not conventions. "
+)
+MATH_TRANSCRIPTION_PROMPT = MATH_BASELINE_PROMPT + (
     "Return LaTeX only in the latex field; visible MathML is generated from that same string by code. "
     "Labels on close-up sheets are source atom IDs, never mathematical content. "
 )
@@ -346,6 +348,9 @@ def latex_to_mathml(latex, *, display="inline"):
             tag = node.tag.rsplit("}", 1)[-1]
             if tag in arity and len(node) != arity[tag]:
                 raise ValueError("invalid mathematical tree")
+            if any(key.rsplit('}',1)[-1].lower() in {'href','src','style'} or
+                   key.rsplit('}',1)[-1].lower().startswith('on') for key in node.attrib):
+                raise ValueError('active mathematical markup')
         semantics = ET.Element(f"{{{MATH_NAMESPACE}}}semantics")
         for child in list(root):
             root.remove(child)

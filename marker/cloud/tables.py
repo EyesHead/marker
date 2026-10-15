@@ -28,7 +28,10 @@ from marker.processors.table_geometry import (
 )
 
 
-TABLE_LABEL = re.compile(r"(?:table|таблиц[аы])\s*(?:№\s*)?(\d+(?:\.\d+)*(?:[a-zа-я])?)", re.IGNORECASE)
+TABLE_LABEL = re.compile(
+    r"(?:table|таблиц[аы])\s*(?:№\s*)?((?:[a-zа-яё]{1,3}\s*\.\s*)?\d+(?:\.\d+)*(?:[a-zа-я])?)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -54,7 +57,7 @@ class TablePart:
     @property
     def table_id(self):
         match = TABLE_LABEL.search(self.caption)
-        return match[1].lower() if match else None
+        return re.sub(r"\s+", "", match[1]).casefold() if match else None
 
     @property
     def is_continuation(self):

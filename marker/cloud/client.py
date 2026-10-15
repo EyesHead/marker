@@ -226,6 +226,95 @@ class CloudClient:
             self.request_count += 1
             return self.request_count
 
+    def request_text(
+        self, prompt, images, validator, *, max_output_tokens=None, image_long_edge=3072
+    ):
+        """Recognize a complete object as HTML/LaTeX without a JSON wrapper.
+
+        The caller supplies a local validator. The original request/attempt
+        budget and credential protections apply; no thumbnail below 2048 pixels
+        replaces a large table crop just to fit an undersized context budget.
+        """
+        images = [images] if isinstance(images, Image.Image) else list(images or [])
+        if len(images) > self.cloud_max_images:
+            raise RecognitionFailure("Required images exceed the cloud request image limit")
+        output_tokens = self.cloud_max_output_tokens if max_output_tokens is None else max_output_tokens
+        original_prompt = current_prompt = prompt
+        reason = "Required content unresolved"
+        attempts = 0
+        for _ in range(self.cloud_max_attempts):
+            try:
+                copies = fit_request(
+                    current_prompt, images, self.cloud_context_tokens, output_tokens,
+                    max_image_edge=image_long_edge,
+                    min_image_edge=min(2048, image_long_edge),
+                )
+            except RecognitionFailure as error:
+                raise RecognitionFailure(error.reason, attempts=attempts) from None
+            content = []
+            for image in copies:
+                buffer = BytesIO()
+                try:
+                    if image.mode not in ("1", "L", "LA", "P", "RGB", "RGBA"):
+                        image = image.convert("RGB")
+                    image.save(buffer, format="PNG")
+                except Exception:
+                    raise RecognitionFailure("Request image encoding failed", attempts=attempts) from None
+                encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+                content.append({"type": "image_url", "image_url": {
+                    "url": "data:image/png;base64," + encoded
+                }})
+            content.append({"type": "text", "text": current_prompt})
+            client = self._get_client()
+            request_number = self._reserve_request(attempts)
+            attempts += 1
+            started = monotonic()
+            logging.getLogger("marker").info(
+                "Ollama request %d, attempt %d/%d (whole object)",
+                request_number, attempts, self.cloud_max_attempts,
+            )
+            try:
+                response = client.chat.completions.create(
+                    model=self.cloud_model,
+                    messages=[{"role": "user", "content": content}],
+                    max_tokens=output_tokens, temperature=0, timeout=self.timeout,
+                )
+                with self._lock:
+                    self.last_usage = response.usage.model_dump() if response.usage else None
+                    self.total_tokens += response.usage.total_tokens if response.usage else 0
+                if not response.choices:
+                    raise ResponseValidationError("Response contains no completion")
+                choice = response.choices[0]
+                if choice.finish_reason == "length":
+                    raise ResponseValidationError("Response was truncated; return the complete object")
+                text = choice.message.content
+                if not isinstance(text, str) or not text.strip():
+                    raise ResponseValidationError("Response contains no recognized content")
+                result = validator(text)
+                logging.getLogger("marker").info(
+                    "Ollama request %d validated in %.1f s", request_number, monotonic() - started
+                )
+                return result
+            except ResponseValidationError as error:
+                reason = str(error)
+                current_prompt = original_prompt + (
+                    "\nThe previous response failed local validation: " + reason +
+                    ". Return the complete corrected object from the same source. "
+                    "Do not omit content, explain the answer, or return JSON."
+                )
+            except RecognitionFailure:
+                raise
+            except Exception as error:
+                if context_overflow(error):
+                    raise RecognitionFailure(
+                        "Whole source exceeds provider context; increase the context budget",
+                        attempts=attempts,
+                    ) from None
+                reason = provider_error_reason(error)
+                if not retryable_provider_error(error):
+                    raise RecognitionFailure(reason, attempts=attempts) from None
+        raise RecognitionFailure(reason, attempts=attempts)
+
     def request(
         self, prompt: str, images, schema: type[BaseModel], *, context_reflow=None
     ) -> dict:
