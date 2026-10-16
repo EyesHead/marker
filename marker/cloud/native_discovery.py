@@ -293,6 +293,11 @@ def _discover(source, page, parent_box, atoms, owners, exclusions, client, store
     """Build a mutation-free proposal, preserving existing verified tables."""
     parent = _region(page.page_id, parent_box, "image", atoms)
     regions, parts = discover_scan(source, parent, client, store=store)
+    if len(regions) == 1:
+        # A single classified object owns the complete source crop, including
+        # frame strokes and inline glyphs outside the model's visual bounds.
+        regions = [replace(regions[0], bbox=tuple(parent_box))]
+        parts = [replace(part, bbox=tuple(parent_box)) for part in parts]
     table_by_box = {(part.page, part.bbox): part for part in parts}
     # Full scan bitmaps carry the source pixels. Their subregions partition
     # the bitmap and therefore must not inherit the same page-sized atom.
@@ -311,7 +316,9 @@ def _discover(source, page, parent_box, atoms, owners, exclusions, client, store
             continue
         matches = [index for index, region in enumerate(regions) if _inside(box, region.bbox)]
         if len(matches) != 1:
-            raise RecognitionFailure("Scanned discovery omitted or multiply assigned an original source atom")
+            raise RecognitionFailure(
+                f"Page {page.page_id + 1}: scanned discovery omitted or multiply assigned "
+                f"an original source atom ({atom.get('kind')}, bbox={tuple(box)})")
         assigned[matches[0]].append(atom)
     proposals, removed, preserved = [], set(), set()
     for index, region in enumerate(regions):
