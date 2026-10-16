@@ -232,6 +232,8 @@ class NativeLLMProcessor(WholeObjectRecognizer, BaseLLMProcessor):
     def __call__(self, document):
         if not self.use_llm:
             return
+        if hasattr(self.client, "bind_document"):
+            self.client.bind_document(document.filepath)
         if hasattr(self.client, "start_document"):
             self.client.start_document()
         started = monotonic()
@@ -244,6 +246,8 @@ class NativeLLMProcessor(WholeObjectRecognizer, BaseLLMProcessor):
                      "images": self.client.cloud_max_images, "dpi": self.cloud_crop_dpi,
                      "force_ocr": self.force_ocr, "disable_ocr": self.disable_ocr,
                      "pages": [page.page_id for page in document.pages]}
+        if hasattr(self.client, "reasoning_effort"):
+            signature["reasoning_effort"] = self.client.reasoning_effort
         store = StageStore(root, document.filepath, signature)
         completed, jobs, failures = [], [], []
         with PdfSource(document.filepath, crop_dpi=self.cloud_crop_dpi) as source:
@@ -253,9 +257,12 @@ class NativeLLMProcessor(WholeObjectRecognizer, BaseLLMProcessor):
                     document, source, blocks, self.client, store)
             except RecognitionFailure as error:
                 report = {"status": "incomplete", "pipeline": "native-marker-v1",
+                          "source_sha256": store.input_hash,
                           "reasons": [error.reason], "publishable": False,
                           "requests": self.client.request_count - initial_requests,
                           "model": self.client.cloud_model, "work_dir": str(store.root)}
+                if hasattr(self.client, "budget_snapshot"):
+                    report["budget"] = self.client.budget_snapshot()
                 store.write_text("report.json", json.dumps(report, ensure_ascii=False))
                 document.cloud_conversion = report
                 raise
@@ -332,6 +339,7 @@ class NativeLLMProcessor(WholeObjectRecognizer, BaseLLMProcessor):
                     failures.append({"job": job["id"], "page": job["owners"][0].page_id + 1,
                                      "reasons": list(result.reasons)})
             report = {"status": "incomplete" if failures else "complete",
+                      "source_sha256": store.input_hash,
                       "reasons": [f"Page {item['page']}: {reason}" for item in failures for reason in item["reasons"]],
                       "pipeline": "native-marker-v1", "model": self.client.cloud_model,
                       "requests": self.client.request_count - initial_requests,
@@ -340,6 +348,8 @@ class NativeLLMProcessor(WholeObjectRecognizer, BaseLLMProcessor):
                       "elapsed_seconds": monotonic() - started, "work_dir": str(store.root),
                       "generated_assets": sorted({name for _, result in completed for name in result.resources}),
                       "publishable": not failures}
+            if hasattr(self.client, "budget_snapshot"):
+                report["budget"] = self.client.budget_snapshot()
             store.write_text("report.json", json.dumps(report, ensure_ascii=False))
             document.cloud_conversion = report
             if failures:

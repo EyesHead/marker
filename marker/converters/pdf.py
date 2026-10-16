@@ -51,7 +51,7 @@ from marker.schema.blocks import Block
 from marker.schema.registry import register_block_class
 from marker.util import strings_to_classes
 from marker.processors.llm.llm_handwriting import LLMHandwritingProcessor
-from marker.services.ollama import OllamaService
+from marker.services.openai_budget import OpenAIBudgetService
 from marker.processors.line_merge import LineMergeProcessor
 from marker.processors.llm.llm_mathblock import LLMMathBlockProcessor
 from marker.processors.llm.llm_page_correction import LLMPageCorrectionProcessor
@@ -118,7 +118,7 @@ class PdfConverter(BaseConverter):
         BlankPageProcessor,
         DebugProcessor,
     )
-    default_llm_service: BaseService = OllamaService
+    default_llm_service: BaseService = OpenAIBudgetService
 
     @classmethod
     def uses_native_llm(cls, config, processor_list=None):
@@ -269,6 +269,9 @@ class PdfConverter(BaseConverter):
             )
         finally:
             self.config = original_config
+        cloud_client = getattr(self.llm_service, "client", None)
+        if hasattr(cloud_client, "bind_document"):
+            cloud_client.bind_document(document.filepath)
         structure_builder_cls = self.resolve_dependencies(StructureBuilder)
         structure_builder_cls(document)
 

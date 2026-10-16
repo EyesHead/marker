@@ -211,6 +211,8 @@ def _document_request(method):
 class CloudClient:
     """One shared instance owns every attempt across a document's cloud stages."""
 
+    provider_label = "Ollama"
+
     def __init__(self, config=None, *, client=None):
         config = config.model_dump() if isinstance(config, BaseModel) else dict(config or {})
         # Keep the primitive window-planning defaults stable. Whole-object
@@ -288,6 +290,13 @@ class CloudClient:
         if metadata is not None:
             metadata["llm_tokens_used"] = metadata.get("llm_tokens_used", 0) + tokens
 
+    def _create_completion(self, client, content, output_tokens, timeout):
+        """Transport hook; recognition/validation and attempt budgets stay shared."""
+        return client.chat.completions.create(
+            model=self.cloud_model, messages=[{"role": "user", "content": content}],
+            max_tokens=output_tokens, temperature=0, timeout=timeout,
+        )
+
     @_document_request
     def request_text(
         self, prompt, images, validator, *, max_output_tokens=None, image_long_edge=3072,
@@ -338,16 +347,12 @@ class CloudClient:
                 metadata["llm_request_count"] = metadata.get("llm_request_count", 0) + 1
             started = monotonic()
             logging.getLogger("marker").info(
-                "Ollama request %d, attempt %d/%d (whole object)",
-                request_number, attempts, attempt_limit,
+                "%s request %d, attempt %d/%d (whole object)",
+                self.provider_label, request_number, attempts, attempt_limit,
             )
             try:
                 with self._concurrency:
-                    response = client.chat.completions.create(
-                        model=self.cloud_model,
-                        messages=[{"role": "user", "content": content}],
-                        max_tokens=output_tokens, temperature=0, timeout=request_timeout,
-                    )
+                    response = self._create_completion(client, content, output_tokens, request_timeout)
                 self._record_usage(response.usage, metadata)
                 if not response.choices:
                     raise ResponseValidationError("Response contains no completion")
@@ -359,7 +364,7 @@ class CloudClient:
                     raise ResponseValidationError("Response contains no recognized content")
                 result = validator(text)
                 logging.getLogger("marker").info(
-                    "Ollama request %d validated in %.1f s", request_number, monotonic() - started
+                    "%s request %d validated in %.1f s", self.provider_label, request_number, monotonic() - started
                 )
                 return result
             except ResponseValidationError as error:
@@ -426,26 +431,25 @@ class CloudClient:
                 metadata["llm_request_count"] = metadata.get("llm_request_count", 0) + 1
             started = monotonic()
             logging.getLogger("marker").info(
-                "Ollama request %d, attempt %d/%d", request_number, attempts, attempt_limit
+                "%s request %d, attempt %d/%d", self.provider_label, request_number, attempts, attempt_limit
             )
             try:
                 with self._concurrency:
-                    response = client.chat.completions.create(
-                        model=self.cloud_model, messages=[{"role": "user", "content": content}],
-                        max_tokens=output_tokens, temperature=0, timeout=request_timeout,
-                    )
+                    response = self._create_completion(client, content, output_tokens, request_timeout)
                 self._record_usage(response.usage, metadata)
                 if not response.choices:
                     raise ResponseValidationError("Response contains no completion")
                 choice = response.choices[0]
                 result = validate_response(choice.message.content, schema, choice.finish_reason)
                 logging.getLogger("marker").info(
-                    "Ollama request %d validated in %.1f s", request_number, monotonic() - started
+                    "%s request %d validated in %.1f s", self.provider_label, request_number, monotonic() - started
                 )
                 return result
             except ResponseValidationError as error:
                 reason = str(error)
                 current_prompt = repair_prompt(original_prompt, reason)
+            except RecognitionFailure:
+                raise
             except Exception as error:
                 if context_overflow(error):
                     reason = "Provider context limit exceeded; reduce the assigned source window"

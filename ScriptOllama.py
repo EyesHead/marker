@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Portable, standard-library launcher for adaptive Ollama Cloud conversion."""
+"""Portable PDF conversion launcher with an OpenAI dollar budget."""
 
 import argparse
 import codecs
+from decimal import Decimal, InvalidOperation
 import getpass
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -48,12 +50,13 @@ def nonsecret_environment():
     return {k: v for k, v in os.environ.items() if k not in {"OLLAMA_API_KEY", "OPENAI_API_KEY"}}
 
 
-def request_api_key():
-    """Return an in-memory credential, or None on cancellation/unavailable input."""
+def request_api_key(provider="openai"):
+    """Prefer hidden GUI input; return None on cancellation or unsafe input."""
+    label = "OpenAI" if provider == "openai" else "Ollama Cloud"
     if sys.platform == "darwin" and shutil.which("osascript"):
-        script = ('text returned of (display dialog "Ollama Cloud API key:" '
+        script = (f'text returned of (display dialog "{label} API key:" '
                   'default answer "" with hidden answer buttons {"Cancel", "Continue"} '
-                  'default button "Continue" with title "Marker / Ollama")')
+                  f'default button "Continue" with title "Marker / {label}")')
         try:
             result = subprocess.run(["osascript", "-e", script], capture_output=True,
                                     text=True, env=nonsecret_environment())
@@ -63,30 +66,33 @@ def request_api_key():
                 return None
         except OSError:
             pass
+    else:
+        try:
+            import tkinter
+            from tkinter import simpledialog
+            root = tkinter.Tk()
+            root.withdraw()
+            try:
+                value = simpledialog.askstring(f"Marker / {label}", f"{label} API key:",
+                                               show="*", parent=root)
+                return value.strip() if value and value.strip() else None
+            finally:
+                root.destroy()
+        except (ImportError, RuntimeError):
+            pass
+        except Exception as error:
+            # Tk can be installed without an available display. Never include
+            # GUI exception values, which can reflect user input, in output.
+            if not isinstance(error, tkinter.TclError):
+                raise
     if sys.stdin.isatty():
         try:
             with warnings.catch_warnings():
-                # getpass's echoing fallback must never read the credential.
                 warnings.simplefilter("error", getpass.GetPassWarning)
-                return getpass.getpass("Ollama Cloud API key: ").strip() or None
+                return getpass.getpass(f"{label} API key: ").strip() or None
         except (EOFError, KeyboardInterrupt, getpass.GetPassWarning):
             return None
-    try:
-        import tkinter
-        from tkinter import simpledialog
-    except ImportError:
-        return None
-    try:
-        root = tkinter.Tk()
-        root.withdraw()
-        try:
-            value = simpledialog.askstring("Marker / Ollama", "Ollama Cloud API key:",
-                                           show="*", parent=root)
-            return value.strip() if value and value.strip() else None
-        finally:
-            root.destroy()
-    except (RuntimeError, tkinter.TclError):
-        return None
+    return None
 
 
 class _SecretRedactor:
@@ -120,8 +126,9 @@ class _SecretRedactor:
 
 
 class Processes:
-    def __init__(self, secret):
+    def __init__(self, secret, provider="openai"):
         self.secret = secret
+        self.provider = provider
         self.env = nonsecret_environment()
         self.env.update(PYTHONUTF8="1", PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
 
@@ -156,7 +163,7 @@ class Processes:
     def run(self, args, *, cwd=None, conversion=False, quiet=False):
         env = dict(self.env)
         if conversion:
-            env["OLLAMA_API_KEY"] = self.secret
+            env["OPENAI_API_KEY" if self.provider == "openai" else "OLLAMA_API_KEY"] = self.secret
             env["PYTHONPATH"] = str(cwd)
         try:
             if conversion:
@@ -184,6 +191,8 @@ def adaptive_source(source):
             and (source / "marker/converters/ollama_document.py").is_file()
             and (source / "marker/processors/llm/llm_native.py").is_file()
             and (source / "marker/cloud/defaults.py").is_file()
+            and (source / "marker/cloud/openai_client.py").is_file()
+            and (source / "marker/services/openai_budget.py").is_file()
             and not (source / "marker/processors/llm/llm_table_json.py").exists())
 
 
@@ -241,23 +250,37 @@ def completion_metadata(folder, name):
     raise LauncherError(f"Missing or invalid cloud completion metadata for {name}.")
 
 
-def complete_output(folder, name):
+def complete_output(folder, name, *, model=None, source_pdf=None):
     if not (folder / (name + ".md")).is_file() or (folder / (name + "_tables.json")).exists():
         return False
     try:
-        return completion_metadata(folder, name)["status"] == "complete"
+        metadata = completion_metadata(folder, name)
+        if metadata["status"] != "complete" or model is not None and metadata.get("model") != model:
+            return False
+        if source_pdf is not None:
+            digest = hashlib.sha256()
+            with open(source_pdf, "rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            return metadata.get("source_sha256") == digest.hexdigest()
+        return True
     except LauncherError:
         return False
 
 
 def conversion_arguments(args, python, pdf, output):
+    service = ("marker.services.openai_budget.OpenAIBudgetService" if args.provider == "openai"
+               else "marker.services.ollama.OllamaService")
     command = [python, "-m", "marker.scripts.convert_single", pdf,
                "--converter_cls", CONVERTER, "--output_dir", output,
-               "--output_format", "markdown", "--use_llm",
-               "--llm_service", "marker.services.ollama.OllamaService",
-               "--cloud_base_url", args.base_url, "--cloud_model", args.model,
-               "--timeout", "180",
-               "--page_batch_size", args.page_batch_size, "--redo_inline_math"]
+               "--output_format", "markdown", "--use_llm", "--llm_service", service,
+               "--timeout", "180", "--page_batch_size", args.page_batch_size, "--redo_inline_math"]
+    if args.provider == "openai":
+        command.extend(["--openai_base_url", args.base_url, "--openai_model", args.model,
+                        "--openai_reasoning_effort", "low", "--cloud_budget_usd", args.budget_usd,
+                        "--cloud_budget_dir", args.cache_dir / "budgets"])
+    else:
+        command.extend(["--cloud_base_url", args.base_url, "--cloud_model", args.model])
     for field in ("context_tokens", "max_output_tokens", "max_images", "crop_dpi", "max_attempts", "max_requests", "max_concurrency"):
         command.extend(["--cloud_" + field, getattr(args, field)])
     command.extend(["--cloud_work_dir", args.directory / "Output" / ".marker-work"])
@@ -325,17 +348,42 @@ def parse_arguments(argv):
     parser.add_argument("--cache-dir", type=Path, default=default_cache_dir())
     parser.add_argument("--repo", default=os.environ.get("MARKER_REPO", REPOSITORY))
     parser.add_argument("--ref", default=os.environ.get("MARKER_REF", REF))
-    parser.add_argument("--model", default=os.environ.get("OLLAMA_MODEL", "kimi-k3"))
-    parser.add_argument("--base-url", default=os.environ.get("OLLAMA_BASE_URL", "https://ollama.com/v1"))
+    parser.add_argument("--provider", choices=("openai", "ollama"), default="openai")
+    parser.add_argument("--model", default=None)
+    parser.add_argument("--base-url", default=None)
+    parser.add_argument("--budget-usd", default="1",
+                        help="Maximum cumulative OpenAI model cost per PDF, above 0 and at most 1 USD.")
+    parser.add_argument("--file", default=None, help="Convert only this exact filename inside PDF.")
     for name, default in (("context_tokens", 245760), ("max_output_tokens", 16384),
-                          ("max_images", 16), ("crop_dpi", 600), ("max_attempts", 3), ("max_requests", 0), ("max_concurrency", 2)):
+                          ("max_images", 16), ("crop_dpi", 600), ("max_requests", 0), ("max_concurrency", 2)):
         parser.add_argument("--" + name.replace("_", "-"), type=int,
                             default=os.environ.get("CLOUD_" + name.upper(), default))
+    parser.add_argument("--max-attempts", type=int, default=os.environ.get("CLOUD_MAX_ATTEMPTS"))
     parser.add_argument("--page-batch-size", type=int, default=os.environ.get("PAGE_BATCH_SIZE", 30))
     for name in ("force", "update_marker", "disable_ocr", "force_ocr"):
         parser.add_argument("--" + name.replace("_", "-"), action="store_true",
                             default=os.environ.get(name.upper()) == "1")
     args = parser.parse_args(argv)
+    if args.max_attempts is None:
+        args.max_attempts = 2 if args.provider == "openai" else 3
+    prefix = "OPENAI" if args.provider == "openai" else "OLLAMA"
+    args.model = args.model or os.environ.get(prefix + "_MODEL") or (
+        "gpt-6-luna" if args.provider == "openai" else "kimi-k3")
+    args.base_url = args.base_url or os.environ.get(prefix + "_BASE_URL") or (
+        "https://api.openai.com/v1" if args.provider == "openai" else "https://ollama.com/v1")
+    if args.provider == "openai":
+        if args.model not in {"gpt-6-luna", "gpt-6.1-sol"}:
+            parser.error("OpenAI budget pricing supports gpt-6-luna and gpt-6.1-sol")
+        if args.base_url.rstrip("/") != "https://api.openai.com/v1":
+            parser.error("Budgeted OpenAI conversion requires https://api.openai.com/v1")
+    try:
+        args.budget_usd = Decimal(args.budget_usd)
+    except InvalidOperation:
+        parser.error("budget-usd must be a decimal above 0 and at most 1")
+    if not args.budget_usd.is_finite() or not Decimal("0") < args.budget_usd <= Decimal("1"):
+        parser.error("budget-usd must be a decimal above 0 and at most 1")
+    if args.file is not None and (not args.file or "/" in args.file or "\\" in args.file or Path(args.file).suffix.lower() != ".pdf"):
+        parser.error("file must be a PDF filename directly inside PDF")
     for name in ("context_tokens", "max_output_tokens", "max_images", "crop_dpi", "max_attempts", "page_batch_size"):
         if getattr(args, name) < 1:
             parser.error(name.replace("_", "-") + " must be positive")
@@ -366,22 +414,28 @@ def main(argv=None) -> int:
         pdf_dir, output = args.directory / "PDF", args.directory / "Output"
         pdf_dir.mkdir(parents=True, exist_ok=True)
         output.mkdir(parents=True, exist_ok=True)
+        if args.file and not (pdf_dir / args.file).is_file():
+            raise LauncherError(f"Selected PDF was not found: {args.file}")
         pending = []
         for pdf in sorted(pdf_dir.iterdir()):
-            if pdf.is_file() and pdf.suffix.lower() == ".pdf":
-                if not args.force and complete_output(output / pdf.stem, pdf.stem):
+            if pdf.is_file() and pdf.suffix.lower() == ".pdf" and (args.file is None or pdf.name == args.file):
+                if not args.force and complete_output(output / pdf.stem, pdf.stem,
+                                                      model=args.model, source_pdf=pdf):
                     processes.message(f"Skipping complete PDF: {pdf.name}")
                 else:
                     pending.append(pdf)
         if not pending:
             processes.message("No pending PDF files.")
             return 0
-        secret = os.environ.get("OLLAMA_API_KEY", "").strip() or request_api_key()
+        key_variable = "OPENAI_API_KEY" if args.provider == "openai" else "OLLAMA_API_KEY"
+        secret = os.environ.get(key_variable, "").strip() or request_api_key(args.provider)
         if not secret:
-            raise LauncherError("Credential entry cancelled or unavailable; use a hidden prompt or OLLAMA_API_KEY.")
-        processes = Processes(secret)
+            raise LauncherError(f"Credential entry cancelled or unavailable; use a hidden prompt or {key_variable}.")
+        processes = Processes(secret, args.provider)
         python, source, revision = ensure_install(args, processes)
-        processes.message(f"Marker: {source} ({revision[:12]}); Ollama Cloud: {args.model}")
+        processes.message(f"Marker: {source} ({revision[:12]}); {args.provider}: {args.model}")
+        if args.provider == "openai":
+            processes.message(f"Cumulative model budget per PDF: ${args.budget_usd}")
         failures = 0
         with tempfile.TemporaryDirectory(prefix="marker-ollama-") as temporary:
             for index, pdf in enumerate(pending):

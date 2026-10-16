@@ -30,7 +30,7 @@ dependencies = [
     "filetype>=1.2.0,<2",
     "google-genai>=1.40.0,<3",
     "anthropic>=0.69.0,<1",
-    "openai>=2.2.0,<3",
+    "openai>=2.54.0,<3",
     "scikit-learn>=1.6.1,<2",
     "latex2mathml>=3.81.0,<4",
 ]
